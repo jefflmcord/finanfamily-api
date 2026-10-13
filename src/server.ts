@@ -29,19 +29,19 @@ app.get('/health', (req: Request, res: Response) => {
   return res.status(200).json({ status: 'ok', message: 'FinanFamily API está ativa!' });
 });
 
-// Endpoint de fallback para /api/dashboard/summary (caso não esteja dentro de router)
+// Endpoint de fallback para /api/dashboard/summary
 app.get('/api/dashboard/summary', async (req: Request, res: Response) => {
   const { family_id, month, year } = req.query;
 
   try {
-    // Se existir conexão ativa, consulta dados consolidados
     return res.status(200).json({
       family_id: family_id || null,
       period: { month, year },
-      total_balance: 0,
-      total_income: 0,
-      total_expense: 0,
-      investments: 0
+      // Estrutura atualizada para evitar o erro 'reading projected'
+      total_balance: { current: 0, projected: 0 },
+      total_income: { current: 0, projected: 0 },
+      total_expense: { current: 0, projected: 0 },
+      investments: { current: 0, projected: 0 }
     });
   } catch (error: any) {
     console.error('Erro ao consultar indicadores do dashboard:', error);
