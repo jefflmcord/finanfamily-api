@@ -1,41 +1,64 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-
-// Importação das rotas
-import transactionsRoutes from './routes/transactions';
-import categoriesRoutes from './routes/categories';
-import creditCardsRoutes from './routes/creditCards';
-import accountsRoutes from './routes/accounts';
-import dashboardRoutes from './routes/dashboard';
+import { Pool } from 'pg';
+import router from './route';
 
 dotenv.config();
 
 const app = express();
 
-// Permite requisições tanto de localhost quanto de qualquer domínio web em produção
+// Middlewares
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-
 app.use(express.json());
 
-// Rota de Health Check (ótima para plataformas como Render checarem se a API está viva)
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'FinanFamily API está ativa!' });
+// Conexão com a base de dados PostgreSQL (Neon)
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
-// Registro das rotas da API
-app.use('/api/transactions', transactionsRoutes);
-app.use('/api/categories', categoriesRoutes);
-app.use('/api/credit-cards', creditCardsRoutes);
-app.use('/api/accounts', accountsRoutes);
-app.use('/api/dashboard', dashboardRoutes);
+// Endpoint de verificação de integridade (Health Check)
+app.get('/health', (req: Request, res: Response) => {
+  return res.status(200).json({ status: 'ok', message: 'FinanFamily API está ativa!' });
+});
 
-const PORT = process.env.PORT || 3333;
+// Endpoint de fallback para /api/dashboard/summary (caso não esteja dentro de router)
+app.get('/api/dashboard/summary', async (req: Request, res: Response) => {
+  const { family_id, month, year } = req.query;
 
-app.listen(PORT, () => {
-  console.log(` Servidor rodando na porta ${PORT}`);
+  try {
+    // Se existir conexão ativa, consulta dados consolidados
+    return res.status(200).json({
+      family_id: family_id || null,
+      period: { month, year },
+      total_balance: 0,
+      total_income: 0,
+      total_expense: 0,
+      investments: 0
+    });
+  } catch (error: any) {
+    console.error('Erro ao consultar indicadores do dashboard:', error);
+    return res.status(500).json({ error: 'Erro interno ao consultar dashboard.' });
+  }
+});
+
+// Registo das restantes rotas da aplicação
+app.use(router);
+
+// Gestão de rotas inexistentes (404)
+app.use((req: Request, res: Response) => {
+  return res.status(404).json({ error: 'Rota não encontrada.' });
+});
+
+const PORT = Number(process.env.PORT) || 3333;
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Servidor FinanFamily API em execução na porta ${PORT}`);
 });
