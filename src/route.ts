@@ -10,16 +10,16 @@ router.get('/ping', (req: Request, res: Response) => {
   return res.json({ message: 'pong' });
 });
 
-// Endpoint 1: Login
+// Endpoint 1: Login de Usuário
 router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   const { email, password } = req.body;
 
   if (!email || !password) {
-    return res.status(400).json({ error: 'Email e senha são obrigatórios.' });
+    return res.status(400).json({ error: 'E-mail e senha são obrigatórios.' });
   }
 
   try {
-    // 1. Procurar o utilizador pelo email
+    // 1. Buscar o usuário pelo e-mail
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     const user = result.rows[0];
 
@@ -27,7 +27,7 @@ router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
       return res.status(401).json({ error: 'Credenciais inválidas.' });
     }
 
-    // 2. Verificar se a senha confere com o hash
+    // 2. Verificar se a senha confere com o hash salvo no banco
     const isPasswordValid = await bcrypt.compare(password, user.password_hash);
     if (!isPasswordValid) {
       return res.status(401).json({ error: 'Credenciais inválidas.' });
@@ -41,7 +41,7 @@ router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
       { expiresIn: '1d' } // Token válido por 1 dia
     );
 
-    // 4. Devolver os dados de acesso (incluindo o aviso de troca de senha)
+    // 4. Retornar os dados de acesso (incluindo a flag de troca de senha no primeiro acesso)
     return res.status(200).json({
       token,
       user: {
@@ -58,7 +58,7 @@ router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   }
 });
 
-// Endpoint 2: Troca de Senha Obrigatória
+// Endpoint 2: Troca de Senha Obrigatória (Primeiro Acesso)
 router.post('/api/update-password', async (req: Request, res: Response): Promise<any> => {
   const { email, oldPassword, newPassword } = req.body;
 
@@ -71,20 +71,20 @@ router.post('/api/update-password', async (req: Request, res: Response): Promise
     const user = result.rows[0];
 
     if (!user) {
-      return res.status(404).json({ error: 'Utilizador não encontrado.' });
+      return res.status(404).json({ error: 'Usuário não encontrado.' });
     }
 
     // Verificar se a senha atual (provisória) está correta
     const isPasswordValid = await bcrypt.compare(oldPassword, user.password_hash);
     if (!isPasswordValid) {
-      return res.status(401).json({ error: 'A senha atual está incorreta.' });
+      return res.status(401).json({ error: 'A senha provisória informada está incorreta.' });
     }
 
-    // Gerar o hash da nova senha
+    // Gerar o hash da nova senha definitiva
     const salt = await bcrypt.genSalt(10);
     const newPasswordHash = await bcrypt.hash(newPassword, salt);
 
-    // Atualizar no banco e remover a trava de troca obrigatória
+    // Atualizar no banco e liberar a trava de troca obrigatória
     await pool.query(
       'UPDATE users SET password_hash = $1, must_change_password = FALSE WHERE id = $2',
       [newPasswordHash, user.id]
@@ -97,28 +97,4 @@ router.post('/api/update-password', async (req: Request, res: Response): Promise
   }
 });
 
-// Rota temporária para criar o administrador com a criptografia correta
-router.get('/api/setup', async (req: Request, res: Response): Promise<any> => {
-  try {
-    const email = 'admin@finanfamily.com';
-    const password = '123456';
-    const family_id = '0663962f-71e2-43e1-a8a5-0c017f68536d';
-
-    // 1. Gera a palavra-passe criptografada perfeitamente
-    const salt = await bcrypt.genSalt(10);
-    const hash = await bcrypt.hash(password, salt);
-
-    // 2. Apaga o utilizador antigo com erro e insere o novo
-    await pool.query('DELETE FROM users WHERE email = $1', [email]);
-    await pool.query(
-      'INSERT INTO users (family_id, name, email, password_hash, must_change_password) VALUES ($1, $2, $3, $4, TRUE)',
-      [family_id, 'Administrador FinanFamily', email, hash]
-    );
-
-    return res.json({ message: 'Utilizador criado com sucesso! Pode efetuar o login.' });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ error: 'Erro ao criar utilizador.' });
-  }
-});
 export default router;
