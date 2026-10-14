@@ -97,4 +97,28 @@ router.post('/api/update-password', async (req: Request, res: Response): Promise
   }
 });
 
+// Rota temporária para criar o administrador com a criptografia correta
+router.get('/api/setup', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const email = 'admin@finanfamily.com';
+    const password = '123456';
+    const family_id = '0663962f-71e2-43e1-a8a5-0c017f68536d';
+
+    // 1. Gera a palavra-passe criptografada perfeitamente
+    const salt = await bcrypt.genSalt(10);
+    const hash = await bcrypt.hash(password, salt);
+
+    // 2. Apaga o utilizador antigo com erro e insere o novo
+    await pool.query('DELETE FROM users WHERE email = $1', [email]);
+    await pool.query(
+      'INSERT INTO users (family_id, name, email, password_hash, must_change_password) VALUES ($1, $2, $3, $4, TRUE)',
+      [family_id, 'Administrador FinanFamily', email, hash]
+    );
+
+    return res.json({ message: 'Utilizador criado com sucesso! Pode efetuar o login.' });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Erro ao criar utilizador.' });
+  }
+});
 export default router;
