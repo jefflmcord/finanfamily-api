@@ -9,18 +9,6 @@ const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
-// Garantir criação da tabela goals se não existir
-pool.query(`
-  CREATE TABLE IF NOT EXISTS goals (
-    id SERIAL PRIMARY KEY,
-    family_id INTEGER NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    target_amount NUMERIC(12, 2) NOT NULL,
-    months INTEGER NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-`).catch(err => console.error('Erro ao criar tabela goals:', err));
-
 // Rota raiz para teste de status
 router.get('/', (req: Request, res: Response) => {
   return res.status(200).json({ status: 'online', message: 'API FinanFamily a funcionar perfeitamente!' });
