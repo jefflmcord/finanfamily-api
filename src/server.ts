@@ -1,8 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-
-// Importando as suas rotas modulares existentes
+import authRouter from './routes/auth';
 import accountsRouter from './routes/accounts';
 import categoriesRouter from './routes/categories';
 import creditCardsRouter from './routes/creditCards';
@@ -12,11 +11,10 @@ import goalsRouter from './routes/goals';
 dotenv.config();
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
-// Registrando os endpoints modulares
+app.use('/api', authRouter); // Mapeia /api/login e /api/register
 app.use('/api/accounts', accountsRouter);
 app.use('/api/categories', categoriesRouter);
 app.use('/api/credit-cards', creditCardsRouter);
@@ -24,9 +22,6 @@ app.use('/api/transactions', transactionsRouter);
 app.use('/api/goals', goalsRouter);
 
 const PORT = process.env.PORT || 4000;
-
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
-
-export { app };
