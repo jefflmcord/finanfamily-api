@@ -48,7 +48,6 @@ async function ensureInvestmentCategory(client: any, familyId: number) {
   if (catRes.rows.length > 0) {
     return catRes.rows[0].id;
   }
-  // Se não existir, cria
   const newCat = await client.query(
     `INSERT INTO categories (family_id, name, flow_type) VALUES ($1, 'Investimento', 'EXPENSE') RETURNING id`,
     [familyId]
@@ -128,8 +127,6 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
         const familyId = familyRes.rows[0].id;
 
         await client.query('INSERT INTO accounts (family_id, name, balance) VALUES ($1, $2, $3)', [familyId, 'Conta Principal', 0]);
-        
-        // Criar categoria pre-cadastrada "Investimento"
         await client.query('INSERT INTO categories (family_id, name, flow_type) VALUES ($1, $2, $3)', [familyId, 'Investimento', 'EXPENSE']);
 
         const userRes = await client.query(
@@ -318,7 +315,7 @@ router.post('/api/transactions', async (req: Request, res: Response): Promise<an
   }
 });
 
-// 7. METAS / OBJETIVOS (Com categoria "Investimento" automática)
+// 7. METAS / OBJETIVOS
 router.get('/api/goals', async (req: Request, res: Response): Promise<any> => {
   const { family_id } = req.query;
   if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
@@ -341,16 +338,13 @@ router.post('/api/goals', async (req: Request, res: Response): Promise<any> => {
   try {
     await client.query('BEGIN');
     
-    // 1. Salvar o objetivo
     const goalRes = await client.query(
       `INSERT INTO goals (family_id, title, target_amount, months) VALUES ($1, $2, $3, $4) RETURNING *;`,
       [family_id, title, target_amount, months]
     );
 
-    // 2. Garantir que a categoria "Investimento" existe e obter o seu ID
     const investmentCategoryId = await ensureInvestmentCategory(client, Number(family_id));
 
-    // 3. Gerar parcelas nas transações (Contas a Pagar) com a categoria "Investimento"
     const totalInst = Math.max(1, Number(months));
     const instAmount = Math.round((Number(target_amount) / totalInst) * 100) / 100;
     const today = new Date().toISOString().split('T')[0];
@@ -389,7 +383,7 @@ router.post('/api/goals', async (req: Request, res: Response): Promise<any> => {
     }
 
     await client.query('COMMIT');
-    return res.status(201).json({ message: 'Objetivo criado e parcelas geradas na categoria Investimento com sucesso!', goal: goalRes.rows[0] });
+    return res.status(201).json({ message: 'Objetivo criado com sucesso!', goal: goalRes.rows[0] });
   } catch (err: any) {
     await client.query('ROLLBACK');
     return res.status(500).json({ error: err.message });
