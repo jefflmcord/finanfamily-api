@@ -98,7 +98,8 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
         const familyRes = await client.query('INSERT INTO families (name) VALUES ($1) RETURNING id', [`Família de ${name || 'Utilizador'}`]);
         const familyId = familyRes.rows[0].id;
 
-        await client.query('INSERT INTO accounts (family_id, name, current_balance) VALUES ($1, $2, $3)', [familyId, 'Conta Principal', 0]);
+        // Correção efetuada: utilizando a coluna 'balance' em vez de 'current_balance'
+        await client.query('INSERT INTO accounts (family_id, name, balance) VALUES ($1, $2, $3)', [familyId, 'Conta Principal', 0]);
 
         const userRes = await client.query(
           `INSERT INTO users (name, email, google_id, avatar_url, family_id, email_verified) VALUES ($1, $2, $3, $4, $5, TRUE) RETURNING id, name, email, family_id, avatar_url`,
@@ -134,7 +135,7 @@ router.get('/api/accounts', async (req: Request, res: Response): Promise<any> =>
 
   try {
     const result = await pool.query(
-      `SELECT id, name, initial_balance, current_balance, color FROM accounts WHERE family_id = $1 ORDER BY name ASC`,
+      `SELECT id, name, balance, color FROM accounts WHERE family_id = $1 ORDER BY name ASC`,
       [String(family_id)]
     );
     return res.json(result.rows);
@@ -303,7 +304,7 @@ router.get('/api/goals', async (req: Request, res: Response): Promise<any> => {
 router.get('/api/dashboard/summary', authenticateToken, async (req: any, res: Response): Promise<any> => {
   const familyId = req.user.family_id;
   try {
-    const balanceResult = await pool.query('SELECT COALESCE(SUM(current_balance), 0) as total FROM accounts WHERE family_id = $1', [familyId]);
+    const balanceResult = await pool.query('SELECT COALESCE(SUM(balance), 0) as total FROM accounts WHERE family_id = $1', [familyId]);
     const incomeResult = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE family_id = $1 AND type='INCOME' AND status='PAID'", [familyId]);
     const expenseResult = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE family_id = $1 AND type='EXPENSE' AND status='PAID'", [familyId]);
 
