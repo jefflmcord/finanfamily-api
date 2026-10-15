@@ -376,4 +376,81 @@ router.post('/api/reset-password', async (req: Request, res: Response): Promise<
   }
 });
 
+// ============================================================================
+// MIDDLEWARE DE AUTENTICAÇÃO
+// ============================================================================
+import { NextFunction } from 'express';
+
+const authenticateToken = (req: any, res: Response, next: NextFunction): any => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Formato: "Bearer TOKEN"
+
+  if (!token) {
+    return res.status(401).json({ error: 'Acesso negado. Token ausente.' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
+    if (err) return res.status(403).json({ error: 'Token inválido ou expirado.' });
+    req.user = user; // Guarda o id e family_id do utilizador logado
+    next();
+  });
+};
+
+// ============================================================================
+// ROTAS DO DASHBOARD (SISTEMA INTERNO)
+// ============================================================================
+
+router.get('/api/dashboard/summary', authenticateToken, async (req: any, res: Response): Promise<any> => {
+  const familyId = req.user.family_id;
+
+  try {
+    // 1. Obter o Saldo Total das contas da família
+    const balanceResult = await pool.query(
+      'SELECT COALESCE(SUM(balance), 0) as total_balance FROM accounts WHERE family_id = $1',
+      [familyId]
+    );
+    const currentBalance = parseFloat(balanceResult.rows[0].total_balance);
+
+    // 2. Obter Receitas e Despesas do Mês Atual
+    // (Assumindo que já existe uma tabela 'transactions' com as colunas amount, type e date)
+    const currentMonthResult = await pool.query(`
+      SELECT 
+        COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) as total_income,
+        COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) as total_expense
+      FROM transactions 
+      WHERE family_id = $1 
+        AND date >= date_trunc('month', CURRENT_DATE)
+        AND date < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+    `, [familyId]);
+
+    const monthlyIncome = parseFloat(currentMonthResult.rows[0].total_income);
+    const monthlyExpense = parseFloat(currentMonthResult.rows[0].total_expense);
+
+    // 3. Obter as despesas agrupadas por categoria para o gráfico
+    const categoryResult = await pool.query(`
+      SELECT c.name, c.color, COALESCE(SUM(t.amount), 0) as total
+      FROM categories c
+      LEFT JOIN transactions t ON c.id = t.category_id 
+        AND t.date >= date_trunc('month', CURRENT_DATE) 
+        AND t.date < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+      WHERE c.family_id = $1 AND c.type = 'expense'
+      GROUP BY c.id, c.name, c.color
+      HAVING COALESCE(SUM(t.amount), 0) > 0
+      ORDER BY total DESC
+      LIMIT 4
+    `, [familyId]);
+
+    return res.status(200).json({
+      balance: currentBalance,
+      income: monthlyIncome,
+      expense: monthlyExpense,
+      categories: categoryResult.rows
+    });
+
+  } catch (error) {
+    console.error('Erro ao carregar dashboard:', error);
+    return res.status(500).json({ error: 'Erro ao carregar os dados do dashboard.' });
+  }
+});
+
 export default router;
