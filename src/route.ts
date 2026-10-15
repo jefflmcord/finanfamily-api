@@ -6,6 +6,11 @@ import { pool } from './server';
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
 
+// Rota raiz para teste (evita Cannot GET no navegador)
+router.get('/', (req: Request, res: Response) => {
+  return res.status(200).json({ status: 'online', message: 'API FinanFamily a funcionar perfeitamente!' });
+});
+
 // Middleware de Autenticação
 const authenticateToken = (req: any, res: Response, next: NextFunction): any => {
   const authHeader = req.headers['authorization'];
