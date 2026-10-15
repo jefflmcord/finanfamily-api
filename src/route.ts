@@ -69,7 +69,7 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
   try {
     const ticket = await googleClient.verifyIdToken({
       idToken: credential,
-      audience: GOOGLE_CLIENT_ID,
+      audience: GOOGLE_CLIENT_ID || undefined,
     });
 
     const payload = ticket.getPayload();
@@ -92,7 +92,6 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
         user = updateResult.rows[0];
       }
     } else {
-      // Criação automática de Família e Utilizador (Tenant) para quem entra com Google
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
@@ -123,8 +122,8 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
 
     return res.status(200).json({ token, user });
   } catch (err: any) {
-    console.error('Erro no Google Auth:', err);
-    return res.status(500).json({ error: 'Erro ao autenticar com o Google.' });
+    console.error('Erro detalhado no Google Auth:', err.message || err);
+    return res.status(500).json({ error: `Erro ao autenticar com o Google: ${err.message || 'Erro interno'}` });
   }
 });
 
