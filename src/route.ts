@@ -9,6 +9,18 @@ const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
+// Garantir criação da tabela goals se não existir
+pool.query(`
+  CREATE TABLE IF NOT EXISTS goals (
+    id SERIAL PRIMARY KEY,
+    family_id INTEGER NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    target_amount NUMERIC(12, 2) NOT NULL,
+    months INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`).catch(err => console.error('Erro ao criar tabela goals:', err));
+
 // Rota raiz para teste de status
 router.get('/', (req: Request, res: Response) => {
   return res.status(200).json({ status: 'online', message: 'API FinanFamily a funcionar perfeitamente!' });
@@ -26,6 +38,23 @@ const authenticateToken = (req: any, res: Response, next: NextFunction): any => 
     next();
   });
 };
+
+// Função auxiliar para garantir que a categoria "Investimento" existe para a família
+async function ensureInvestmentCategory(client: any, familyId: number) {
+  let catRes = await client.query(
+    `SELECT id FROM categories WHERE family_id = $1 AND LOWER(name) = 'investimento'`,
+    [familyId]
+  );
+  if (catRes.rows.length > 0) {
+    return catRes.rows[0].id;
+  }
+  // Se não existir, cria
+  const newCat = await client.query(
+    `INSERT INTO categories (family_id, name, flow_type) VALUES ($1, 'Investimento', 'EXPENSE') RETURNING id`,
+    [familyId]
+  );
+  return newCat.rows[0].id;
+}
 
 // 1. LOGIN TRADICIONAL
 router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
@@ -61,7 +90,7 @@ router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   }
 });
 
-// 2. GOOGLE OAUTH (LOGIN / REGISTRO COM GOOGLE)
+// 2. GOOGLE OAUTH
 router.post('/api/auth/google', async (req: Request, res: Response): Promise<any> => {
   const { credential } = req.body;
   if (!credential) return res.status(400).json({ error: 'Token do Google não fornecido.' });
@@ -98,8 +127,10 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
         const familyRes = await client.query('INSERT INTO families (name) VALUES ($1) RETURNING id', [`Família de ${name || 'Utilizador'}`]);
         const familyId = familyRes.rows[0].id;
 
-        // Correção efetuada: utilizando a coluna 'balance' em vez de 'current_balance'
         await client.query('INSERT INTO accounts (family_id, name, balance) VALUES ($1, $2, $3)', [familyId, 'Conta Principal', 0]);
+        
+        // Criar categoria pre-cadastrada "Investimento"
+        await client.query('INSERT INTO categories (family_id, name, flow_type) VALUES ($1, $2, $3)', [familyId, 'Investimento', 'EXPENSE']);
 
         const userRes = await client.query(
           `INSERT INTO users (name, email, google_id, avatar_url, family_id, email_verified) VALUES ($1, $2, $3, $4, $5, TRUE) RETURNING id, name, email, family_id, avatar_url`,
@@ -123,8 +154,8 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
 
     return res.status(200).json({ token, user });
   } catch (err: any) {
-    console.error('Erro detalhado no Google Auth:', err.message || err);
-    return res.status(500).json({ error: `Erro ao autenticar com o Google: ${err.message || 'Erro interno'}` });
+    console.error('Erro no Google Auth:', err);
+    return res.status(500).json({ error: 'Erro ao autenticar com o Google.' });
   }
 });
 
@@ -287,7 +318,7 @@ router.post('/api/transactions', async (req: Request, res: Response): Promise<an
   }
 });
 
-// 7. METAS / INVESTIMENTOS
+// 7. METAS / OBJETIVOS (Com categoria "Investimento" automática)
 router.get('/api/goals', async (req: Request, res: Response): Promise<any> => {
   const { family_id } = req.query;
   if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
@@ -300,41 +331,70 @@ router.get('/api/goals', async (req: Request, res: Response): Promise<any> => {
   }
 });
 
-// DASHBOARD SUMMARY
-router.get('/api/dashboard/summary', authenticateToken, async (req: any, res: Response): Promise<any> => {
-  const familyId = req.user.family_id;
-  try {
-    const balanceResult = await pool.query('SELECT COALESCE(SUM(balance), 0) as total FROM accounts WHERE family_id = $1', [familyId]);
-    const incomeResult = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE family_id = $1 AND type='INCOME' AND status='PAID'", [familyId]);
-    const expenseResult = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE family_id = $1 AND type='EXPENSE' AND status='PAID'", [familyId]);
-
-    return res.status(200).json({
-      balance: parseFloat(balanceResult.rows[0].total),
-      income: parseFloat(incomeResult.rows[0].total),
-      expense: parseFloat(expenseResult.rows[0].total),
-      categories: []
-    });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+router.post('/api/goals', async (req: Request, res: Response): Promise<any> => {
+  const { family_id, title, target_amount, months } = req.body;
+  if (!family_id || !title || !target_amount || !months) {
+    return res.status(400).json({ error: 'family_id, title, target_amount e months são obrigatórios.' });
   }
-});
 
-router.get('/api/dashboard/data', authenticateToken, async (req: any, res: Response): Promise<any> => {
-  const familyId = req.user.family_id;
+  const client = await pool.connect();
   try {
-    const categories = await pool.query('SELECT * FROM categories WHERE family_id = $1', [familyId]);
-    const accounts = await pool.query('SELECT * FROM accounts WHERE family_id = $1', [familyId]);
-    const cards = await pool.query('SELECT * FROM credit_cards WHERE family_id = $1', [familyId]);
-    const transactions = await pool.query('SELECT * FROM transactions WHERE family_id = $1', [familyId]);
+    await client.query('BEGIN');
+    
+    // 1. Salvar o objetivo
+    const goalRes = await client.query(
+      `INSERT INTO goals (family_id, title, target_amount, months) VALUES ($1, $2, $3, $4) RETURNING *;`,
+      [family_id, title, target_amount, months]
+    );
 
-    return res.status(200).json({
-      categories: categories.rows,
-      accounts: accounts.rows,
-      cards: cards.rows,
-      transactions: transactions.rows
-    });
+    // 2. Garantir que a categoria "Investimento" existe e obter o seu ID
+    const investmentCategoryId = await ensureInvestmentCategory(client, Number(family_id));
+
+    // 3. Gerar parcelas nas transações (Contas a Pagar) com a categoria "Investimento"
+    const totalInst = Math.max(1, Number(months));
+    const instAmount = Math.round((Number(target_amount) / totalInst) * 100) / 100;
+    const today = new Date().toISOString().split('T')[0];
+
+    let parentId: string | null = null;
+    for (let i = 1; i <= totalInst; i++) {
+      const [year, month, day] = today.split('-');
+      const targetDate = new Date(Number(year), Number(month) - 1 + (i - 1), Number(day));
+      const formattedDueDate = targetDate.toISOString().split('T')[0];
+
+      const txDesc = `Objetivo: ${title} (${i}/${totalInst})`;
+
+      const txRes = await client.query(
+        `INSERT INTO transactions (
+          family_id, category_id, description, amount, type, status, transaction_date, due_date,
+          installment_number, total_installments, parent_transaction_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *;`,
+        [
+          family_id,
+          investmentCategoryId,
+          txDesc,
+          instAmount,
+          'EXPENSE',
+          'PENDING',
+          today,
+          formattedDueDate,
+          i,
+          totalInst,
+          parentId
+        ]
+      );
+
+      if (i === 1) {
+        parentId = txRes.rows[0].id;
+      }
+    }
+
+    await client.query('COMMIT');
+    return res.status(201).json({ message: 'Objetivo criado e parcelas geradas na categoria Investimento com sucesso!', goal: goalRes.rows[0] });
   } catch (err: any) {
+    await client.query('ROLLBACK');
     return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
