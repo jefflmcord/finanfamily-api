@@ -1,12 +1,15 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import { OAuth2Client } from 'google-auth-library';
 import { pool } from './server';
 
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
-// Rota raiz para teste (evita Cannot GET no navegador)
+// Rota raiz para teste de status
 router.get('/', (req: Request, res: Response) => {
   return res.status(200).json({ status: 'online', message: 'API FinanFamily a funcionar perfeitamente!' });
 });
@@ -24,7 +27,7 @@ const authenticateToken = (req: any, res: Response, next: NextFunction): any => 
   });
 };
 
-// 1. LOGIN
+// 1. LOGIN TRADICIONAL
 router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -58,7 +61,66 @@ router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   }
 });
 
-// 2. CONTAS BANCÁRIAS
+// 2. GOOGLE OAUTH
+router.post('/api/auth/google', async (req: Request, res: Response): Promise<any> => {
+  const { credential } = req.body;
+  if (!credential) return res.status(400).json({ error: 'Token do Google não fornecido.' });
+
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    if (!payload || !payload.email) {
+      return res.status(400).json({ error: 'Falha ao ler dados do Google.' });
+    }
+
+    const { email, name, sub: googleId, picture: avatarUrl } = payload;
+    const cleanEmail = email.toLowerCase();
+
+    let result = await pool.query('SELECT * FROM users WHERE email = $1', [cleanEmail]);
+    let user = result.rows[0];
+
+    if (!user) {
+      // Criação automática de Família e Utilizador (Tenant)
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const familyRes = await client.query('INSERT INTO families (name) VALUES ($1) RETURNING id', [`Família de ${name || 'Utilizador'}`]);
+        const familyId = familyRes.rows[0].id;
+
+        await client.query('INSERT INTO accounts (family_id, name, current_balance) VALUES ($1, $2, $3)', [familyId, 'Conta Principal', 0]);
+
+        const userRes = await client.query(
+          `INSERT INTO users (name, email, google_id, avatar_url, family_id, email_verified) VALUES ($1, $2, $3, $4, $5, TRUE) RETURNING id, name, email, family_id, avatar_url`,
+          [name || 'Utilizador', cleanEmail, googleId, avatarUrl || null, familyId]
+        );
+        user = userRes.rows[0];
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    }
+
+    const token = jwt.sign(
+      { id: user.id, family_id: user.family_id },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.status(200).json({ token, user });
+  } catch (err: any) {
+    console.error('Erro no Google Auth:', err);
+    return res.status(500).json({ error: 'Erro ao autenticar com o Google.' });
+  }
+});
+
+// 3. CONTAS BANCÁRIAS
 router.get('/api/accounts', async (req: Request, res: Response): Promise<any> => {
   const { family_id } = req.query;
   if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
@@ -74,7 +136,7 @@ router.get('/api/accounts', async (req: Request, res: Response): Promise<any> =>
   }
 });
 
-// 3. CATEGORIAS
+// 4. CATEGORIAS
 router.get('/api/categories', async (req: Request, res: Response): Promise<any> => {
   const { family_id } = req.query;
   if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
@@ -87,7 +149,7 @@ router.get('/api/categories', async (req: Request, res: Response): Promise<any> 
   }
 });
 
-// 4. CARTÕES DE CRÉDITO
+// 5. CARTÕES DE CRÉDITO
 router.get('/api/credit-cards', async (req: Request, res: Response): Promise<any> => {
   const { family_id } = req.query;
   if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
@@ -120,7 +182,7 @@ router.post('/api/credit-cards', async (req: Request, res: Response): Promise<an
   }
 });
 
-// 5. TRANSAÇÕES / CONTAS A PAGAR E RECEBER
+// 6. TRANSAÇÕES / CONTAS A PAGAR E RECEBER
 router.get('/api/transactions', async (req: Request, res: Response): Promise<any> => {
   const { family_id } = req.query;
   if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
@@ -217,7 +279,7 @@ router.post('/api/transactions', async (req: Request, res: Response): Promise<an
   }
 });
 
-// 6. METAS / INVESTIMENTOS
+// 7. METAS / INVESTIMENTOS
 router.get('/api/goals', async (req: Request, res: Response): Promise<any> => {
   const { family_id } = req.query;
   if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
