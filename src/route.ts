@@ -61,7 +61,7 @@ router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   }
 });
 
-// 2. GOOGLE OAUTH
+// 2. GOOGLE OAUTH (LOGIN / REGISTRO COM GOOGLE)
 router.post('/api/auth/google', async (req: Request, res: Response): Promise<any> => {
   const { credential } = req.body;
   if (!credential) return res.status(400).json({ error: 'Token do Google não fornecido.' });
@@ -83,8 +83,16 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
     let result = await pool.query('SELECT * FROM users WHERE email = $1', [cleanEmail]);
     let user = result.rows[0];
 
-    if (!user) {
-      // Criação automática de Família e Utilizador (Tenant)
+    if (user) {
+      if (!user.google_id) {
+        const updateResult = await pool.query(
+          'UPDATE users SET google_id = $1, avatar_url = $2, email_verified = TRUE WHERE id = $3 RETURNING *',
+          [googleId, avatarUrl, user.id]
+        );
+        user = updateResult.rows[0];
+      }
+    } else {
+      // Criação automática de Família e Utilizador (Tenant) para quem entra com Google
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
