@@ -8,16 +8,12 @@ import { pool } from './server';
 
 const router = Router();
 
-// ============================================================================
-// CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
-// ============================================================================
 const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'SEU_CLIENT_ID_DO_GOOGLE';
 
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
-// Configuração do disparador de e-mails (Nodemailer)
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: Number(process.env.SMTP_PORT) || 587,
@@ -28,29 +24,18 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// ============================================================================
-// MIDDLEWARE DE AUTENTICAÇÃO JWT
-// ============================================================================
 const authenticateToken = (req: any, res: Response, next: NextFunction): any => {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Formato: "Bearer TOKEN"
-
-  if (!token) {
-    return res.status(401).json({ error: 'Acesso negado. Token ausente.' });
-  }
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Acesso negado. Token ausente.' });
 
   jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
-    if (err) {
-      return res.status(403).json({ error: 'Token inválido ou expirado.' });
-    }
-    req.user = user; // Guarda o id e family_id do usuário logado
+    if (err) return res.status(403).json({ error: 'Token inválido ou expirado.' });
+    req.user = user;
     next();
   });
 };
 
-// ============================================================================
-// FUNÇÃO CENTRAL: PROVISIONAMENTO ZERO-TOUCH (MULTI-TENANT)
-// ============================================================================
 async function provisionNewFamilyTenant(
   name: string,
   email: string,
@@ -64,20 +49,17 @@ async function provisionNewFamilyTenant(
   try {
     await client.query('BEGIN');
 
-    // 1. Criar a Família (Tenant isolado)
     const familyResult = await client.query(
       'INSERT INTO families (name) VALUES ($1) RETURNING id',
       [`Família de ${name}`]
     );
     const familyId = familyResult.rows[0].id;
 
-    // 2. Criar Conta Bancária Padrão
     await client.query(
       'INSERT INTO accounts (family_id, name, balance) VALUES ($1, $2, $3)',
       [familyId, 'Conta Principal', 0]
     );
 
-    // 3. Criar Categorias Padrão
     const defaultCategories = [
       { name: 'Moradia & Contas', type: 'expense', color: '#6366f1' },
       { name: 'Alimentação', type: 'expense', color: '#f59e0b' },
@@ -95,7 +77,6 @@ async function provisionNewFamilyTenant(
       );
     }
 
-    // 4. Criar o Usuário vinculado a essa nova Família
     const userResult = await client.query(
       `INSERT INTO users 
       (name, email, password_hash, google_id, avatar_url, family_id, email_verified, verification_token) 
@@ -113,401 +94,204 @@ async function provisionNewFamilyTenant(
   }
 }
 
-// ============================================================================
-// ROTAS DE AUTENTICAÇÃO E REGISTRO
-// ============================================================================
-
-// 1. REGISTRO MANUAL COM VALIDAÇÃO DE E-MAIL
+// Auth Routes
 router.post('/api/register', async (req: Request, res: Response): Promise<any> => {
   const { name, email, password } = req.body;
-
   if (!name || !email || !password || password.length < 6) {
-    return res.status(400).json({ error: 'Preencha todos os campos corretamente (senha mín. 6 caracteres).' });
+    return res.status(400).json({ error: 'Preencha todos os campos corretamente.' });
   }
-
   try {
     const cleanEmail = email.trim().toLowerCase();
-
     const existing = await pool.query('SELECT id FROM users WHERE email = $1', [cleanEmail]);
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ error: 'Este e-mail já está cadastrado no sistema.' });
-    }
+    if (existing.rows.length > 0) return res.status(400).json({ error: 'E-mail já cadastrado.' });
 
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
     const verificationToken = crypto.randomBytes(32).toString('hex');
 
-    await provisionNewFamilyTenant(
-      name.trim(),
-      cleanEmail,
-      passwordHash,
-      null,
-      null,
-      false,
-      verificationToken
-    );
-
+    await provisionNewFamilyTenant(name.trim(), cleanEmail, passwordHash, null, null, false, verificationToken);
+    
     const verifyUrl = `${FRONTEND_URL}/verificar-email?token=${verificationToken}`;
-
     await transporter.sendMail({
       from: '"Equipe FinanFamily" <seu-email-real@gmail.com>',
       to: cleanEmail,
-      subject: 'Bem-vindo ao FinanFamily! Confirme seu e-mail',
-      html: `
-        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; color: #333;">
-          <h2 style="color: #10b981;">Olá, ${name}!</h2>
-          <p>Falta muito pouco para você acessar o painel inteligente da sua família.</p>
-          <p>Por favor, clique no botão abaixo para verificar sua conta e liberar o seu acesso:</p>
-          <br/>
-          <a href="${verifyUrl}" style="padding: 12px 24px; background-color: #10b981; color: #fff; text-decoration: none; border-radius: 8px; font-weight: bold;">
-            Verificar Meu E-mail Agora
-          </a>
-          <br/><br/>
-          <p style="font-size: 12px; color: #888;">Se você não solicitou este cadastro, pode ignorar este e-mail.</p>
-        </div>
-      `,
+      subject: 'Confirme seu e-mail',
+      html: `<p>Clique para verificar: <a href="${verifyUrl}">${verifyUrl}</a></p>`,
     });
 
-    return res.status(201).json({ message: 'Conta criada! Verifique sua caixa de entrada para ativar o acesso.' });
+    return res.status(201).json({ message: 'Conta criada! Verifique seu e-mail.' });
   } catch (error) {
-    console.error('Erro no registro:', error);
-    return res.status(500).json({ error: 'Erro interno ao criar conta.' });
+    return res.status(500).json({ error: 'Erro ao criar conta.' });
   }
 });
 
-// 2. LOGIN MANUAL TRADICIONAL
 router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   const { email, password } = req.body;
-
-  if (!email || !password) {
-    return res.status(400).json({ error: 'E-mail e senha são obrigatórios.' });
-  }
-
   try {
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.trim().toLowerCase()]);
     const user = result.rows[0];
+    if (!user || !user.password_hash) return res.status(401).json({ error: 'Credenciais inválidas.' });
+    if (!user.email_verified) return res.status(403).json({ error: 'E-mail não verificado.' });
 
-    if (!user || !user.password_hash) {
-      return res.status(401).json({ error: 'Credenciais inválidas ou e-mail vinculado ao Google.' });
-    }
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Credenciais inválidas.' });
 
-    if (!user.email_verified) {
-      return res.status(403).json({ error: 'Por favor, verifique seu e-mail antes de fazer login. Cheque sua caixa de entrada.' });
-    }
-
-    const isPasswordValid = await bcrypt.compare(password, user.password_hash);
-    if (!isPasswordValid) {
-      return res.status(401).json({ error: 'Credenciais inválidas.' });
-    }
-
-    const token = jwt.sign(
-      { id: user.id, family_id: user.family_id },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
+    const token = jwt.sign({ id: user.id, family_id: user.family_id }, JWT_SECRET, { expiresIn: '7d' });
     const { password_hash, verification_token, reset_token, ...safeUser } = user;
-
     return res.status(200).json({ token, user: safeUser });
   } catch (error) {
-    console.error('Erro no login:', error);
-    return res.status(500).json({ error: 'Erro interno no servidor.' });
+    return res.status(500).json({ error: 'Erro no login.' });
   }
 });
 
-// 3. LOGIN / REGISTRO COM GOOGLE OAUTH (Zero-Touch)
 router.post('/api/auth/google', async (req: Request, res: Response): Promise<any> => {
   const { credential } = req.body;
-  if (!credential) return res.status(400).json({ error: 'Token do Google não fornecido.' });
-
   try {
-    const ticket = await googleClient.verifyIdToken({
-      idToken: credential,
-      audience: GOOGLE_CLIENT_ID,
-    });
-
+    const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
     const payload = ticket.getPayload();
-    if (!payload || !payload.email) {
-      return res.status(400).json({ error: 'Falha ao ler dados do Google.' });
-    }
+    if (!payload || !payload.email) return res.status(400).json({ error: 'Erro Google OAuth.' });
 
     const { email, name, sub: googleId, picture: avatarUrl } = payload;
     const cleanEmail = email.toLowerCase();
-
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [cleanEmail]);
     let user = result.rows[0];
 
-    if (user) {
-      if (!user.google_id) {
-        const updateResult = await pool.query(
-          'UPDATE users SET google_id = $1, avatar_url = $2, email_verified = TRUE WHERE id = $3 RETURNING *',
-          [googleId, avatarUrl, user.id]
-        );
-        user = updateResult.rows[0];
-      }
-    } else {
-      user = await provisionNewFamilyTenant(
-        name || 'Usuário',
-        cleanEmail,
-        null,
-        googleId,
-        avatarUrl || null,
-        true,
-        null
-      );
+    if (!user) {
+      user = await provisionNewFamilyTenant(name || 'Usuário', cleanEmail, null, googleId, avatarUrl || null, true, null);
     }
 
-    const token = jwt.sign(
-      { id: user.id, family_id: user.family_id },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
+    const token = jwt.sign({ id: user.id, family_id: user.family_id }, JWT_SECRET, { expiresIn: '7d' });
     const { password_hash, verification_token, reset_token, ...safeUser } = user;
-
     return res.status(200).json({ token, user: safeUser });
   } catch (error) {
-    console.error('Erro na autenticação Google:', error);
-    return res.status(500).json({ error: 'Erro ao validar conta do Google.' });
+    return res.status(500).json({ error: 'Erro Google.' });
   }
 });
 
-// 4. CONFIRMAR E-MAIL CLICADO NO LINK
 router.post('/api/verify-email', async (req: Request, res: Response): Promise<any> => {
   const { token } = req.body;
-  if (!token) return res.status(400).json({ error: 'Token inválido.' });
-
-  try {
-    const result = await pool.query(
-      'UPDATE users SET email_verified = TRUE, verification_token = NULL WHERE verification_token = $1 RETURNING id',
-      [token]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(400).json({ error: 'Link de verificação inválido ou já foi utilizado.' });
-    }
-
-    return res.status(200).json({ message: 'E-mail verificado com sucesso! Você já pode fazer login.' });
-  } catch (error) {
-    console.error('Erro ao verificar email:', error);
-    return res.status(500).json({ error: 'Erro no servidor.' });
-  }
+  const result = await pool.query('UPDATE users SET email_verified = TRUE, verification_token = NULL WHERE verification_token = $1 RETURNING id', [token]);
+  if (result.rows.length === 0) return res.status(400).json({ error: 'Token inválido.' });
+  return res.status(200).json({ message: 'E-mail verificado!' });
 });
 
-// 5. SOLICITAR REDEFINIÇÃO DE SENHA
-router.post('/api/forgot-password', async (req: Request, res: Response): Promise<any> => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'E-mail obrigatório.' });
-
-  try {
-    const cleanEmail = email.trim().toLowerCase();
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [cleanEmail]);
-    const user = result.rows[0];
-
-    if (user && user.password_hash) {
-      const resetToken = crypto.randomBytes(32).toString('hex');
-      const expireDate = new Date(Date.now() + 30 * 60000);
-
-      await pool.query(
-        'UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
-        [resetToken, expireDate, user.id]
-      );
-
-      const resetUrl = `${FRONTEND_URL}/redefinir-senha?token=${resetToken}`;
-
-      await transporter.sendMail({
-        from: '"Suporte FinanFamily" <seu-email-real@gmail.com>',
-        to: cleanEmail,
-        subject: 'Recuperação de Senha - FinanFamily',
-        html: `
-          <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; color: #333;">
-            <h2 style="color: #10b981;">Redefinição de Senha</h2>
-            <p>Recebemos um pedido para alterar a senha da sua conta FinanFamily.</p>
-            <p>Clique no link abaixo para criar uma nova senha (este link expira em 30 minutos):</p>
-            <br/>
-            <a href="${resetUrl}" style="padding: 12px 24px; background-color: #10b981; color: #fff; text-decoration: none; border-radius: 8px; font-weight: bold;">
-              Redefinir Minha Senha
-            </a>
-            <br/><br/>
-            <p style="font-size: 12px; color: #888;">Se você não pediu para alterar a senha, ignore este e-mail. Sua conta continua segura.</p>
-          </div>
-        `,
-      });
-    }
-
-    return res.status(200).json({ message: 'Se o e-mail estiver cadastrado, você receberá um link de recuperação em instantes.' });
-  } catch (error) {
-    console.error('Erro no forgot-password:', error);
-    return res.status(500).json({ error: 'Erro no servidor.' });
-  }
-});
-
-// 6. EXECUTAR REDEFINIÇÃO DE SENHA
-router.post('/api/reset-password', async (req: Request, res: Response): Promise<any> => {
-  const { token, newPassword } = req.body;
-  if (!token || !newPassword || newPassword.length < 6) {
-    return res.status(400).json({ error: 'Dados inválidos. A nova senha deve ter no mínimo 6 caracteres.' });
-  }
-
-  try {
-    const result = await pool.query(
-      'SELECT id FROM users WHERE reset_token = $1 AND reset_token_expires > NOW()',
-      [token]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(400).json({ error: 'Link de recuperação inválido ou já expirado.' });
-    }
-
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(newPassword, salt);
-
-    await pool.query(
-      'UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2',
-      [passwordHash, result.rows[0].id]
-    );
-
-    return res.status(200).json({ message: 'Sua senha foi alterada com sucesso! Você já pode entrar.' });
-  } catch (error) {
-    console.error('Erro no reset-password:', error);
-    return res.status(500).json({ error: 'Erro no servidor.' });
-  }
-});
-
-// ============================================================================
-// ROTAS DO DASHBOARD E LANÇAMENTOS (SISTEMA INTERNO)
-// ============================================================================
-
-// 7. RESUMO FINANCEIRO DO MÊS (SALDO, RECEITAS, DESPESAS E GRÁFICO)
+// Dashboard Summary & Data
 router.get('/api/dashboard/summary', authenticateToken, async (req: any, res: Response): Promise<any> => {
   const familyId = req.user.family_id;
-
   try {
-    const balanceResult = await pool.query(
-      'SELECT COALESCE(SUM(balance), 0) as total_balance FROM accounts WHERE family_id = $1',
-      [familyId]
-    );
-    const currentBalance = parseFloat(balanceResult.rows[0]?.total_balance || '0');
-
-    const currentMonthResult = await pool.query(
-      `SELECT 
-        COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) as total_income,
-        COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) as total_expense
-      FROM transactions 
-      WHERE family_id = $1 
-        AND date >= date_trunc('month', CURRENT_DATE)
-        AND date < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'`,
-      [familyId]
-    );
-
-    const monthlyIncome = parseFloat(currentMonthResult.rows[0]?.total_income || '0');
-    const monthlyExpense = parseFloat(currentMonthResult.rows[0]?.total_expense || '0');
-
-    const categoryResult = await pool.query(
-      `SELECT c.name, c.color, COALESCE(SUM(t.amount), 0) as total
+    const balanceResult = await pool.query('SELECT COALESCE(SUM(balance), 0) as total FROM accounts WHERE family_id = $1', [familyId]);
+    const incomeResult = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE family_id = $1 AND type='income' AND date >= date_trunc('month', CURRENT_DATE)", [familyId]);
+    const expenseResult = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE family_id = $1 AND type='expense' AND date >= date_trunc('month', CURRENT_DATE)", [familyId]);
+    
+    const categories = await pool.query(`
+      SELECT c.name, c.color, COALESCE(SUM(t.amount), 0) as total
       FROM categories c
-      LEFT JOIN transactions t ON c.id = t.category_id 
-        AND t.date >= date_trunc('month', CURRENT_DATE) 
-        AND t.date < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+      LEFT JOIN transactions t ON c.id = t.category_id AND t.date >= date_trunc('month', CURRENT_DATE)
       WHERE c.family_id = $1 AND c.type = 'expense'
-      GROUP BY c.id, c.name, c.color
-      HAVING COALESCE(SUM(t.amount), 0) > 0
-      ORDER BY total DESC
-      LIMIT 4`,
-      [familyId]
-    );
+      GROUP BY c.id, c.name, c.color HAVING COALESCE(SUM(t.amount), 0) > 0
+    `, [familyId]);
 
     return res.status(200).json({
-      balance: currentBalance,
-      income: monthlyIncome,
-      expense: monthlyExpense,
-      categories: categoryResult.rows,
+      balance: parseFloat(balanceResult.rows[0].total),
+      income: parseFloat(incomeResult.rows[0].total),
+      expense: parseFloat(expenseResult.rows[0].total),
+      categories: categories.rows,
     });
   } catch (error) {
-    console.error('Erro ao carregar dashboard:', error);
-    return res.status(500).json({ error: 'Erro ao carregar os dados do dashboard.' });
+    return res.status(500).json({ error: 'Erro no resumo.' });
   }
 });
 
-// 8. LISTAR CATEGORIAS, CONTAS E TRANSAÇÕES DA FAMÍLIA
 router.get('/api/dashboard/data', authenticateToken, async (req: any, res: Response): Promise<any> => {
   const familyId = req.user.family_id;
   try {
-    const categories = await pool.query(
-      'SELECT * FROM categories WHERE family_id = $1 ORDER BY name ASC',
-      [familyId]
-    );
-    const accounts = await pool.query(
-      'SELECT * FROM accounts WHERE family_id = $1 ORDER BY id ASC',
-      [familyId]
-    );
-    const transactions = await pool.query(
-      `SELECT t.*, c.name as category_name, c.color as category_color, a.name as account_name
+    const categories = await pool.query('SELECT * FROM categories WHERE family_id = $1', [familyId]);
+    const accounts = await pool.query('SELECT * FROM accounts WHERE family_id = $1', [familyId]);
+    const cards = await pool.query('SELECT * FROM credit_cards WHERE family_id = $1', [familyId]);
+    const transactions = await pool.query(`
+      SELECT t.*, c.name as category_name, c.color as category_color, cc.name as card_name
       FROM transactions t
       LEFT JOIN categories c ON t.category_id = c.id
-      LEFT JOIN accounts a ON t.account_id = a.id
-      WHERE t.family_id = $1
-      ORDER BY t.date DESC, t.id DESC
-      LIMIT 50`,
-      [familyId]
-    );
+      LEFT JOIN credit_cards cc ON t.credit_card_id = cc.id
+      WHERE t.family_id = $1 ORDER BY t.date DESC LIMIT 100
+    `, [familyId]);
 
     return res.status(200).json({
       categories: categories.rows,
       accounts: accounts.rows,
+      cards: cards.rows,
       transactions: transactions.rows,
     });
   } catch (error) {
-    console.error('Erro ao buscar dados:', error);
-    return res.status(500).json({ error: 'Erro ao buscar dados da família.' });
+    return res.status(500).json({ error: 'Erro ao buscar dados.' });
   }
 });
 
-// 9. CRIAR NOVO LANÇAMENTO E ATUALIZAR SALDO BANCÁRIO AUTOMATICAMENTE
+// Criar Transação / Contas a Pagar / Receber com Parcelamento e Cartão
 router.post('/api/transactions', authenticateToken, async (req: any, res: Response): Promise<any> => {
   const familyId = req.user.family_id;
   const userId = req.user.id;
-  const { description, amount, type, category_id, account_id, date, status } = req.body;
+  const { description, amount, type, category_id, account_id, credit_card_id, payment_method, date, due_date, installment_total, status } = req.body;
 
   if (!description || !amount || !type || !date) {
-    return res.status(400).json({ error: 'Preencha todos os campos obrigatórios.' });
+    return res.status(400).json({ error: 'Campos obrigatórios ausentes.' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const totalInst = parseInt(installment_total) || 1;
+    const baseAmount = parseFloat(amount);
+    const installmentValue = Number((baseAmount / totalInst).toFixed(2));
 
-    let targetAccountId = account_id;
-    if (!targetAccountId) {
-      const accRes = await client.query('SELECT id FROM accounts WHERE family_id = $1 LIMIT 1', [familyId]);
-      targetAccountId = accRes.rows[0]?.id;
-    }
+    for (let i = 1; i <= totalInst; i++) {
+      let instDate = new Date(date);
+      instDate.setMonth(instDate.getMonth() + (i - 1));
+      const formattedDate = instDate.toISOString().split('T')[0];
 
-    const numericAmount = parseFloat(amount);
+      let instDueDate = due_date ? new Date(due_date) : new Date(date);
+      if (due_date) instDueDate.setMonth(instDueDate.getMonth() + (i - 1));
+      const formattedDueDate = instDueDate.toISOString().split('T')[0];
 
-    const result = await client.query(
-      `INSERT INTO transactions 
-       (family_id, account_id, category_id, user_id, description, amount, type, date, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [familyId, targetAccountId, category_id || null, userId, description, numericAmount, type, date, status || 'paid']
-    );
+      const desc = totalInst > 1 ? `${description} (${i}/${totalInst})` : description;
+      const txStatus = status || (payment_method === 'cartao_credito' ? 'pending' : 'paid');
 
-    if ((status || 'paid') === 'paid' && targetAccountId) {
-      const balanceChange = type === 'income' ? numericAmount : -numericAmount;
-      await client.query(
-        'UPDATE accounts SET balance = COALESCE(balance, 0) + $1 WHERE id = $2 AND family_id = $3',
-        [balanceChange, targetAccountId, familyId]
+      const resInsert = await client.query(
+        `INSERT INTO transactions 
+         (family_id, account_id, category_id, credit_card_id, user_id, description, amount, type, date, due_date, payment_method, installment_current, installment_total, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
+        [familyId, account_id || null, category_id || null, credit_card_id || null, userId, desc, installmentValue, type, formattedDate, formattedDueDate, payment_method || 'boleto', i, totalInst, txStatus]
       );
+
+      if (txStatus === 'paid' && account_id && type === 'expense') {
+        await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [installmentValue, account_id]);
+      } else if (txStatus === 'paid' && account_id && type === 'income') {
+        await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [installmentValue, account_id]);
+      }
     }
 
     await client.query('COMMIT');
-    return res.status(201).json(result.rows[0]);
+    return res.status(201).json({ message: 'Lançamento(s) criado(s) com sucesso!' });
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Erro ao salvar transação:', error);
-    return res.status(500).json({ error: 'Erro ao salvar lançamento.' });
+    return res.status(500).json({ error: 'Erro ao salvar transação.' });
   } finally {
     client.release();
+  }
+});
+
+// Cadastrar Cartão de Crédito
+router.post('/api/credit-cards', authenticateToken, async (req: any, res: Response): Promise<any> => {
+  const familyId = req.user.family_id;
+  const { name, limit_amount, closing_day, due_day, color } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO credit_cards (family_id, name, limit_amount, closing_day, due_day, color) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [familyId, name, limit_amount, closing_day, due_day, color || '#6366f1']
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    return res.status(500).json({ error: 'Erro ao cadastrar cartão.' });
   }
 });
 
