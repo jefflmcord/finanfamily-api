@@ -1,27 +1,27 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import authRouter from './routes/auth';
-import accountsRouter from './routes/accounts';
-import categoriesRouter from './routes/categories';
-import creditCardsRouter from './routes/creditCards';
-import transactionsRouter from './routes/transactions';
-import goalsRouter from './routes/goals';
+import { Pool } from 'pg';
+import router from './route';
 
 dotenv.config();
 
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
-app.use('/api', authRouter); // Mapeia /api/login e /api/register
-app.use('/api/accounts', accountsRouter);
-app.use('/api/categories', categoriesRouter);
-app.use('/api/credit-cards', creditCardsRouter);
-app.use('/api/transactions', transactionsRouter);
-app.use('/api/goals', goalsRouter);
+// Configuração da Ligação à Base de Dados PostgreSQL (Neon)
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Registar as rotas unificadas
+app.use(router);
 
 const PORT = process.env.PORT || 4000;
+
 app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
+  console.log(`Servidor FinanFamily rodando na porta ${PORT}`);
 });
