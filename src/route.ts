@@ -234,10 +234,126 @@ router.get('/api/accounts', requireFamilyPermission('family_read'), async (req: 
 
   try {
     const result = await pool.query(
-      `SELECT id, name, balance FROM accounts WHERE family_id = $1 ORDER BY name ASC`,
+      `SELECT id, name, bank_name, agency, account_number, pix_key,
+              initial_balance, balance
+       FROM accounts
+       WHERE family_id = $1
+       ORDER BY name ASC`,
       [String(family_id)]
     );
     return res.json(result.rows);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/api/accounts', requireFamilyPermission('accounts_manage'), async (req: Request, res: Response): Promise<any> => {
+  const { bank_name, agency, account_number, pix_key, initial_balance } = req.body;
+  const normalizedBank = typeof bank_name === 'string' ? bank_name.trim() : '';
+  const normalizedAccount = typeof account_number === 'string' ? account_number.trim() : '';
+  const openingBalance = Math.round(Number(initial_balance) * 100) / 100;
+
+  if (!normalizedBank || !normalizedAccount || !Number.isFinite(openingBalance)) {
+    return res.status(400).json({ error: 'Informe um banco, número da conta e saldo inicial válidos.' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO accounts (
+         family_id, name, bank_name, agency, account_number, pix_key, initial_balance, balance
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+       RETURNING id, name, bank_name, agency, account_number, pix_key, initial_balance, balance`,
+      [
+        req.familyAccess!.familyId,
+        `${normalizedBank} • ${normalizedAccount}`,
+        normalizedBank,
+        typeof agency === 'string' ? agency.trim() || null : null,
+        normalizedAccount,
+        typeof pix_key === 'string' ? pix_key.trim() || null : null,
+        openingBalance
+      ]
+    );
+    return res.status(201).json({ message: 'Conta bancária cadastrada.', account: result.rows[0] });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/api/accounts/:id', requireFamilyPermission('accounts_manage'), async (req: Request, res: Response): Promise<any> => {
+  const { bank_name, agency, account_number, pix_key, initial_balance } = req.body;
+  const normalizedBank = typeof bank_name === 'string' ? bank_name.trim() : '';
+  const normalizedAccount = typeof account_number === 'string' ? account_number.trim() : '';
+  const openingBalance = Math.round(Number(initial_balance) * 100) / 100;
+  if (!normalizedBank || !normalizedAccount || !Number.isFinite(openingBalance)) {
+    return res.status(400).json({ error: 'Informe um banco, número da conta e saldo inicial válidos.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const currentResult = await client.query(
+      'SELECT id, balance, initial_balance FROM accounts WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [req.params.id, req.familyAccess!.familyId]
+    );
+    const current = currentResult.rows[0];
+    if (!current) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Conta bancária não encontrada.' });
+    }
+
+    const balanceAdjustment = openingBalance - Number(current.initial_balance);
+    const result = await client.query(
+      `UPDATE accounts
+       SET name = $1, bank_name = $2, agency = $3, account_number = $4,
+           pix_key = $5, initial_balance = $6, balance = balance + $7
+       WHERE id = $8 AND family_id = $9
+       RETURNING id, name, bank_name, agency, account_number, pix_key, initial_balance, balance`,
+      [
+        `${normalizedBank} • ${normalizedAccount}`,
+        normalizedBank,
+        typeof agency === 'string' ? agency.trim() || null : null,
+        normalizedAccount,
+        typeof pix_key === 'string' ? pix_key.trim() || null : null,
+        openingBalance,
+        balanceAdjustment,
+        req.params.id,
+        req.familyAccess!.familyId
+      ]
+    );
+    await client.query('COMMIT');
+    return res.json({ message: 'Conta bancária atualizada.', account: result.rows[0] });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+router.delete('/api/accounts/:id', requireFamilyPermission('accounts_manage'), async (req: Request, res: Response): Promise<any> => {
+  try {
+    const accountResult = await pool.query(
+      'SELECT id FROM accounts WHERE id = $1 AND family_id = $2',
+      [req.params.id, req.familyAccess!.familyId]
+    );
+    if (accountResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Conta bancária não encontrada.' });
+    }
+
+    const transactionResult = await pool.query(
+      'SELECT 1 FROM transactions WHERE account_id = $1 AND family_id = $2 LIMIT 1',
+      [req.params.id, req.familyAccess!.familyId]
+    );
+    if (transactionResult.rows.length > 0) {
+      return res.status(409).json({ error: 'Não é possível excluir uma conta vinculada a lançamentos.' });
+    }
+
+    await pool.query(
+      'DELETE FROM accounts WHERE id = $1 AND family_id = $2',
+      [req.params.id, req.familyAccess!.familyId]
+    );
+    return res.json({ message: 'Conta bancária excluída.' });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }

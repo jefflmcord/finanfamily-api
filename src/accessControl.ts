@@ -11,6 +11,7 @@ export const FAMILY_PERMISSIONS = [
   'transactions_edit',
   'transactions_delete',
   'transactions_settle',
+  'accounts_manage',
   'cards_manage',
   'categories_manage',
   'goals_manage',
@@ -66,6 +67,18 @@ export async function initializeAccessControl(): Promise<void> {
     )
   `);
   await pool.query('ALTER TABLE transactions ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12, 2)');
+  await pool.query(`
+    ALTER TABLE accounts
+      ADD COLUMN IF NOT EXISTS bank_name TEXT,
+      ADD COLUMN IF NOT EXISTS agency TEXT,
+      ADD COLUMN IF NOT EXISTS account_number TEXT,
+      ADD COLUMN IF NOT EXISTS pix_key TEXT,
+      ADD COLUMN IF NOT EXISTS initial_balance NUMERIC(12, 2)
+  `);
+  await pool.query('UPDATE accounts SET initial_balance = balance WHERE initial_balance IS NULL');
+  await pool.query('ALTER TABLE accounts ALTER COLUMN initial_balance SET DEFAULT 0');
+  await pool.query('ALTER TABLE accounts ALTER COLUMN initial_balance SET NOT NULL');
+  await pool.query('UPDATE accounts SET bank_name = name WHERE bank_name IS NULL');
   await pool.query(`
     CREATE INDEX IF NOT EXISTS family_invitations_family_email_idx
       ON family_invitations (family_id, email)
