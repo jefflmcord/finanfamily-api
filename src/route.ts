@@ -438,7 +438,15 @@ router.patch('/api/transactions/:id/pay', async (req: Request, res: Response): P
       return res.status(400).json({ error: 'O valor pago precisa cobrir o valor total do lançamento.' });
     }
 
-    const accountId = account_id || transaction.account_id;
+    let accountId = account_id || transaction.account_id;
+    if (!accountId) {
+      const defaultAccountResult = await client.query(
+        'SELECT id FROM accounts WHERE family_id = $1 ORDER BY name ASC LIMIT 1 FOR UPDATE',
+        [transaction.family_id]
+      );
+      accountId = defaultAccountResult.rows[0]?.id;
+    }
+
     if (!accountId) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Selecione uma conta para registrar o pagamento.' });
