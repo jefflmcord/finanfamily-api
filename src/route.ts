@@ -766,8 +766,8 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
         `INSERT INTO transactions (
           family_id, account_id, credit_card_id, category_id,
           description, amount, type, status, transaction_date, due_date,
-          installment_number, total_installments, parent_transaction_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *;`,
+          installment_number, total_installments, parent_transaction_id, payment_method
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *;`,
         [
           family_id,
           payment_method === 'CARD' ? null : (account_id || null),
@@ -781,7 +781,8 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
           formattedDueDate,
           isRecurring ? 1 : installmentNumber,
           isRecurring ? 1 : totalInst,
-          isRecurring ? null : parentId
+          isRecurring ? null : parentId,
+          payment_method
         ]
       );
 

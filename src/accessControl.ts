@@ -68,6 +68,15 @@ export async function initializeAccessControl(): Promise<void> {
   `);
   await pool.query('ALTER TABLE transactions ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12, 2)');
   await pool.query(`
+    ALTER TABLE transactions
+      ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'BOLETO'
+  `);
+  await pool.query(`
+    UPDATE transactions
+    SET payment_method = 'CARD'
+    WHERE credit_card_id IS NOT NULL AND payment_method <> 'CARD'
+  `);
+  await pool.query(`
     ALTER TABLE accounts
       ADD COLUMN IF NOT EXISTS bank_name TEXT,
       ADD COLUMN IF NOT EXISTS agency TEXT,
