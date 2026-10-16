@@ -379,5 +379,53 @@ router.post('/api/goals', async (req: Request, res: Response): Promise<any> => {
     client.release();
   }
 });
+// --- EDITAR TRANSAÇÃO ---
+router.put('/api/transactions/:id', async (req: Request, res: Response): Promise<any> => {
+  const { id } = req.params;
+  const { description, amount, due_date, status, category_id, account_id, payment_method } = req.body;
+  
+  try {
+    const result = await pool.query(
+      `UPDATE transactions 
+       SET description = $1, amount = $2, due_date = $3, status = $4, category_id = $5, account_id = $6, payment_method = $7 
+       WHERE id = $8 RETURNING *`,
+      [
+        description, 
+        amount, 
+        due_date, 
+        status, 
+        category_id || null, 
+        payment_method === 'CARD' ? null : (account_id || null), 
+        payment_method || 'BOLETO',
+        id
+      ]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Transação não encontrada.' });
+    return res.json({ message: 'Transação atualizada.', transaction: result.rows[0] });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
+// --- APAGAR TRANSAÇÃO (COM LÓGICA DE PARCELAS) ---
+router.delete('/api/transactions/:id', async (req: Request, res: Response): Promise<any> => {
+  const { id } = req.params;
+  const { scope, parent_id } = req.query; // scope pode ser 'single' (apenas esta) ou 'all' (todas da série)
+
+  try {
+    if (scope === 'all' && parent_id && parent_id !== 'null') {
+      // Apaga a transação original (pai) e todas as suas parcelas filhas
+      await pool.query(
+        `DELETE FROM transactions WHERE id = $1 OR parent_transaction_id = $1 OR id = $2 OR parent_transaction_id = $2`,
+        [parent_id, id]
+      );
+    } else {
+      // Apaga apenas esta transação isolada
+      await pool.query(`DELETE FROM transactions WHERE id = $1`, [id]);
+    }
+    return res.json({ message: 'Transação apagada com sucesso.' });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 export default router;
