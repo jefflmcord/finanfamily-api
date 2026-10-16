@@ -741,9 +741,9 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
       return res.status(400).json({ error: 'O total de parcelas e a parcela inicial devem formar um intervalo válido.' });
     }
     if (!Number.isInteger(recurrenceMonths) || recurrenceMonths < 1 || recurrenceMonths > 120 ||
-        (recurrenceMonths > 1 && (type !== 'EXPENSE' || totalInst !== 1 || startInst !== 1))) {
+        (recurrenceMonths > 1 && (totalInst !== 1 || startInst !== 1))) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'A recorrência deve ter entre 1 e 120 meses e só pode ser usada em contas a pagar sem parcelamento.' });
+      return res.status(400).json({ error: 'A recorrência deve ter entre 1 e 120 meses e não pode ser combinada com parcelamento.' });
     }
     const isRecurring = recurrenceMonths > 1;
     const installmentAmount = Math.round((transactionAmount / totalInst) * 100) / 100;
@@ -794,7 +794,7 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
     await client.query('COMMIT');
     return res.status(201).json({
       message: isRecurring
-        ? `${createdTransactions.length} contas a pagar mensais criadas com sucesso!`
+        ? `${createdTransactions.length} lançamentos mensais criados com sucesso!`
         : 'Lançamento(s) criado(s) com sucesso!',
       transactions: createdTransactions
     });
