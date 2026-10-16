@@ -10,6 +10,7 @@ import {
 } from './accessControl';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
+const INTERNAL_ADMIN_EMAIL = 'jeffersonluismattosocordeiro@gmail.com';
 const publicRouter = Router();
 const router = Router();
 
@@ -147,6 +148,32 @@ router.get('/api/family/access', async (req: Request, res: Response): Promise<an
       ? Object.fromEntries(FAMILY_PERMISSIONS.map(permission => [permission, true]))
       : access.permissions,
   });
+});
+
+router.get('/api/internal/tenants', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const adminResult = await pool.query(
+      'SELECT 1 FROM users WHERE id::text = $1 AND LOWER(email) = $2',
+      [req.familyAccess!.userId, INTERNAL_ADMIN_EMAIL]
+    );
+    if (adminResult.rows.length === 0) {
+      return res.status(403).json({ error: 'Acesso não autorizado.' });
+    }
+
+    const tenantsResult = await pool.query(
+      `SELECT f.id, f.name, f.registered_at,
+              u.name AS owner_name, u.email AS owner_email
+       FROM families f
+       LEFT JOIN family_members fm
+         ON fm.family_id = f.id::text AND fm.role = 'OWNER'
+       LEFT JOIN users u ON u.id::text = fm.user_id
+       ORDER BY f.registered_at DESC NULLS LAST, f.id DESC`
+    );
+    return res.json(tenantsResult.rows);
+  } catch (error: any) {
+    console.error('Erro ao carregar relatório interno de tenants:', error);
+    return res.status(500).json({ error: 'Não foi possível carregar o relatório interno.' });
+  }
 });
 
 router.get('/api/family/profile', async (req: Request, res: Response): Promise<any> => {
