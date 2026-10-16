@@ -7,6 +7,7 @@ import familyRouter, { publicFamilyRouter } from './familyRoutes';
 import {
   authenticateFamilyMember,
   FAMILY_PERMISSIONS,
+  getTenantAccessStatus,
   hashInvitationToken,
   requireFamilyPermission,
 } from './accessControl';
@@ -67,6 +68,16 @@ router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
     const isPasswordValid = await bcrypt.compare(password, user.password_hash);
     if (!isPasswordValid) {
       return res.status(401).json({ error: 'Credenciais inválidas.' });
+    }
+    if (user.family_id) {
+      const tenantStatus = await getTenantAccessStatus(user.family_id);
+      if (tenantStatus.blocked) {
+        return res.status(403).json({
+          code: 'TENANT_BLOCKED',
+          error: 'Seu acesso está temporariamente indisponível.',
+          contact_phone: tenantStatus.contactPhone,
+        });
+      }
     }
 
     const token = jwt.sign(
@@ -140,6 +151,26 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
         );
         user = updateResult.rows[0];
       }
+
+      if (user.family_id) {
+        const tenantStatusResult = await client.query(
+          `SELECT f.blocked_at,
+                  (SELECT value FROM system_settings WHERE key = 'tenant_support_phone') AS contact_phone
+           FROM families f
+           WHERE f.id::text = $1`,
+          [String(user.family_id)]
+        );
+        const tenantStatus = tenantStatusResult.rows[0];
+        if (tenantStatus?.blocked_at) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({
+            code: 'TENANT_BLOCKED',
+            error: 'Seu acesso está temporariamente indisponível.',
+            contact_phone: tenantStatus.contact_phone || '(41) 0000-0000',
+          });
+        }
+      }
+
       if (invitation) {
         if (!user.family_id) {
           const familyUpdate = await client.query(

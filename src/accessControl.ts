@@ -4,6 +4,25 @@ import jwt from 'jsonwebtoken';
 import { pool } from './database';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
+const DEFAULT_SUPPORT_PHONE = '(41) 0000-0000';
+export const INTERNAL_ADMIN_EMAIL = 'jeffersonluismattosocordeiro@gmail.com';
+
+export async function getTenantAccessStatus(familyId: string | number): Promise<{
+  blocked: boolean;
+  contactPhone: string;
+}> {
+  const result = await pool.query(
+    `SELECT f.blocked_at,
+            (SELECT value FROM system_settings WHERE key = 'tenant_support_phone') AS contact_phone
+     FROM families f
+     WHERE f.id::text = $1`,
+    [String(familyId)]
+  );
+  return {
+    blocked: Boolean(result.rows[0]?.blocked_at),
+    contactPhone: result.rows[0]?.contact_phone || DEFAULT_SUPPORT_PHONE,
+  };
+}
 
 export const FAMILY_PERMISSIONS = [
   'family_read',
@@ -84,12 +103,26 @@ export async function initializeAccessControl(): Promise<void> {
   `);
   await pool.query(`
     ALTER TABLE families
-      ADD COLUMN IF NOT EXISTS registered_at TIMESTAMPTZ
+      ADD COLUMN IF NOT EXISTS registered_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ
   `);
   await pool.query(`
     ALTER TABLE families
       ALTER COLUMN registered_at SET DEFAULT NOW()
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS system_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(
+    `INSERT INTO system_settings (key, value)
+     VALUES ('tenant_support_phone', $1)
+     ON CONFLICT (key) DO NOTHING`,
+    [DEFAULT_SUPPORT_PHONE]
+  );
   await pool.query(`
     DO $$
     BEGIN
@@ -169,9 +202,13 @@ export function authenticateFamilyMember(req: Request, res: Response, next: Next
 
     try {
       const result = await pool.query(
-        `SELECT family_id, user_id, role, permissions
-         FROM family_members
-         WHERE user_id = $1`,
+        `SELECT fm.family_id, fm.user_id, fm.role, fm.permissions,
+                f.blocked_at, u.email,
+                (SELECT value FROM system_settings WHERE key = 'tenant_support_phone') AS contact_phone
+         FROM family_members fm
+         JOIN families f ON f.id::text = fm.family_id
+         JOIN users u ON u.id::text = fm.user_id
+         WHERE fm.user_id = $1`,
         [String(decoded.id)]
       );
       const membership = result.rows[0];
@@ -186,6 +223,17 @@ export function authenticateFamilyMember(req: Request, res: Response, next: Next
         role: membership.role,
         permissions: membership.permissions || {},
       };
+      if (membership.blocked_at) {
+        const isInternalAdmin = String(membership.email).toLowerCase() === INTERNAL_ADMIN_EMAIL;
+        if (!isInternalAdmin || !req.originalUrl.startsWith('/api/internal/')) {
+          res.status(403).json({
+            code: 'TENANT_BLOCKED',
+            error: 'Seu acesso está temporariamente indisponível.',
+            contact_phone: membership.contact_phone || DEFAULT_SUPPORT_PHONE,
+          });
+          return;
+        }
+      }
       next();
     } catch (dbError) {
       next(dbError);

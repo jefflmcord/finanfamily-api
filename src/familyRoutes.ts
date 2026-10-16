@@ -6,13 +6,21 @@ import {
   createInvitationToken,
   FAMILY_PERMISSIONS,
   hashInvitationToken,
+  INTERNAL_ADMIN_EMAIL,
   requireFamilyPermission,
 } from './accessControl';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
-const INTERNAL_ADMIN_EMAIL = 'jeffersonluismattosocordeiro@gmail.com';
 const publicRouter = Router();
 const router = Router();
+
+async function isInternalAdmin(userId: string): Promise<boolean> {
+  const result = await pool.query(
+    'SELECT 1 FROM users WHERE id::text = $1 AND LOWER(email) = $2',
+    [userId, INTERNAL_ADMIN_EMAIL]
+  );
+  return result.rows.length > 0;
+}
 
 publicRouter.post('/api/family-invitations/accept', async (req: Request, res: Response): Promise<any> => {
   const { token, name, password } = req.body;
@@ -152,27 +160,102 @@ router.get('/api/family/access', async (req: Request, res: Response): Promise<an
 
 router.get('/api/internal/tenants', async (req: Request, res: Response): Promise<any> => {
   try {
-    const adminResult = await pool.query(
-      'SELECT 1 FROM users WHERE id::text = $1 AND LOWER(email) = $2',
-      [req.familyAccess!.userId, INTERNAL_ADMIN_EMAIL]
-    );
-    if (adminResult.rows.length === 0) {
+    if (!await isInternalAdmin(req.familyAccess!.userId)) {
       return res.status(403).json({ error: 'Acesso não autorizado.' });
     }
 
-    const tenantsResult = await pool.query(
-      `SELECT f.id, f.name, f.registered_at,
-              u.name AS owner_name, u.email AS owner_email
-       FROM families f
-       LEFT JOIN family_members fm
-         ON fm.family_id = f.id::text AND fm.role = 'OWNER'
-       LEFT JOIN users u ON u.id::text = fm.user_id
-       ORDER BY f.registered_at DESC NULLS LAST, f.id DESC`
-    );
-    return res.json(tenantsResult.rows);
+    const [tenantsResult, settingsResult] = await Promise.all([
+      pool.query(
+        `SELECT f.id, f.name, f.registered_at,
+                f.blocked_at,
+                u.name AS owner_name, u.email AS owner_email
+         FROM families f
+         LEFT JOIN family_members fm
+           ON fm.family_id = f.id::text AND fm.role = 'OWNER'
+         LEFT JOIN users u ON u.id::text = fm.user_id
+         ORDER BY f.registered_at DESC NULLS LAST, f.id DESC`
+      ),
+      pool.query(`SELECT value FROM system_settings WHERE key = 'tenant_support_phone'`),
+    ]);
+    return res.json({
+      tenants: tenantsResult.rows,
+      contactPhone: settingsResult.rows[0]?.value || '(41) 0000-0000',
+    });
   } catch (error: any) {
     console.error('Erro ao carregar relatório interno de tenants:', error);
     return res.status(500).json({ error: 'Não foi possível carregar o relatório interno.' });
+  }
+});
+
+router.put('/api/internal/contact-phone', async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!await isInternalAdmin(req.familyAccess!.userId)) {
+      return res.status(403).json({ error: 'Acesso não autorizado.' });
+    }
+    const contactPhone = typeof req.body?.contact_phone === 'string'
+      ? req.body.contact_phone.trim()
+      : '';
+    const digitCount = contactPhone.replace(/\D/g, '').length;
+    if (!/^[\d+().\-\s]{8,30}$/.test(contactPhone) || digitCount < 8) {
+      return res.status(400).json({ error: 'Informe um telefone válido com pelo menos 8 dígitos.' });
+    }
+    const result = await pool.query(
+      `INSERT INTO system_settings (key, value, updated_at)
+       VALUES ('tenant_support_phone', $1, NOW())
+       ON CONFLICT (key)
+       DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+       RETURNING value`,
+      [contactPhone]
+    );
+    return res.json({ contactPhone: result.rows[0].value });
+  } catch (error: any) {
+    console.error('Erro ao atualizar o telefone de contato interno:', error);
+    return res.status(500).json({ error: 'Não foi possível salvar o telefone de contato.' });
+  }
+});
+
+router.patch('/api/internal/tenants/:familyId/status', async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!await isInternalAdmin(req.familyAccess!.userId)) {
+      return res.status(403).json({ error: 'Acesso não autorizado.' });
+    }
+    if (typeof req.body?.blocked !== 'boolean') {
+      return res.status(400).json({ error: 'Informe se o tenant deve ser bloqueado ou desbloqueado.' });
+    }
+    const result = await pool.query(
+      `UPDATE families f
+       SET blocked_at = CASE
+         WHEN $2::boolean THEN COALESCE(f.blocked_at, NOW())
+         ELSE NULL
+       END
+       WHERE f.id::text = $1
+         AND NOT EXISTS (
+           SELECT 1
+           FROM family_members fm
+           JOIN users u ON u.id::text = fm.user_id
+           WHERE fm.family_id = f.id::text
+             AND fm.role = 'OWNER'
+             AND LOWER(u.email) = $3
+         )
+       RETURNING f.id, f.blocked_at`,
+      [req.params.familyId, req.body.blocked, INTERNAL_ADMIN_EMAIL]
+    );
+    if (result.rows.length === 0) {
+      const familyExists = await pool.query(
+        'SELECT 1 FROM families WHERE id::text = $1',
+        [req.params.familyId]
+      );
+      return familyExists.rows.length
+        ? res.status(403).json({ error: 'O tenant da conta administrativa não pode ser bloqueado.' })
+        : res.status(404).json({ error: 'Tenant não encontrado.' });
+    }
+    return res.json({
+      id: result.rows[0].id,
+      blocked_at: result.rows[0].blocked_at,
+    });
+  } catch (error: any) {
+    console.error('Erro ao alterar o acesso do tenant:', error);
+    return res.status(500).json({ error: 'Não foi possível alterar o acesso do tenant.' });
   }
 });
 
