@@ -450,7 +450,7 @@ router.put('/api/categories/:id', requireFamilyPermission('categories_manage'), 
   try {
     await client.query('BEGIN');
     const categoryResult = await client.query(
-      'SELECT id, name, flow_type FROM categories WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      'SELECT id, name, flow_type, budget_amount FROM categories WHERE id = $1 AND family_id = $2 FOR UPDATE',
       [id, req.familyAccess!.familyId]
     );
     const category = categoryResult.rows[0];
@@ -474,16 +474,16 @@ router.put('/api/categories/:id', requireFamilyPermission('categories_manage'), 
       });
     }
 
+    const nextBudgetAmount = flow_type === 'INCOME'
+      ? null
+      : hasBudgetAmount
+        ? budgetAmount
+        : category.budget_amount;
     const result = await client.query(
       `UPDATE categories
-       SET name = $1, type = $2, flow_type = $3, color = $4,
-           budget_amount = CASE
-             WHEN $5::boolean THEN CASE WHEN $3 = 'EXPENSE' THEN $6::numeric ELSE NULL END
-             WHEN $3 = 'INCOME' THEN NULL
-             ELSE budget_amount
-           END
-       WHERE id = $7 AND family_id = $8 RETURNING *`,
-      [normalizedName, type, flow_type, color, hasBudgetAmount, budgetAmount, id, req.familyAccess!.familyId]
+       SET name = $1, type = $2, flow_type = $3, color = $4, budget_amount = $5
+       WHERE id = $6 AND family_id = $7 RETURNING *`,
+      [normalizedName, type, flow_type, color, nextBudgetAmount, id, req.familyAccess!.familyId]
     );
     await client.query('COMMIT');
     return res.json(result.rows[0]);
