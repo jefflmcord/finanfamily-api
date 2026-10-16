@@ -206,6 +206,117 @@ router.post('/api/credit-cards', async (req: Request, res: Response): Promise<an
   }
 });
 
+router.put('/api/credit-cards/:id', async (req: Request, res: Response): Promise<any> => {
+  const { id } = req.params;
+  const { name, brand, total_limit, closing_day, due_day } = req.body;
+  const parsedLimit = Number(total_limit);
+  if (!Number.isFinite(parsedLimit) || parsedLimit <= 0) {
+    return res.status(400).json({ error: 'Informe um limite válido maior que zero.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const cardResult = await client.query(
+      'SELECT id FROM credit_cards WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    if (cardResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Cartão não encontrado.' });
+    }
+
+    const pendingResult = await client.query(
+      "SELECT EXISTS (SELECT 1 FROM transactions WHERE credit_card_id = $1 AND status IS DISTINCT FROM 'PAID') AS has_pending_transactions",
+      [id]
+    );
+    const hasPendingTransactions = pendingResult.rows[0].has_pending_transactions;
+
+    if (hasPendingTransactions) {
+      const fields = Object.keys(req.body);
+      if (fields.some((field) => field !== 'total_limit')) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'O cartão possui lançamentos pendentes. Apenas o limite pode ser alterado.'
+        });
+      }
+
+      const result = await client.query(
+        'UPDATE credit_cards SET total_limit = $1 WHERE id = $2 RETURNING *',
+        [parsedLimit, id]
+      );
+      await client.query('COMMIT');
+      return res.json(result.rows[0]);
+    }
+
+    const parsedClosingDay = Number(closing_day);
+    const parsedDueDay = Number(due_day);
+    if (
+      typeof name !== 'string' || !name.trim() ||
+      typeof brand !== 'string' || !brand.trim() ||
+      !Number.isInteger(parsedClosingDay) || parsedClosingDay < 1 || parsedClosingDay > 31 ||
+      !Number.isInteger(parsedDueDay) || parsedDueDay < 1 || parsedDueDay > 31
+    ) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Informe identificação, bandeira, fechamento e vencimento válidos.' });
+    }
+
+    const result = await client.query(
+      `UPDATE credit_cards
+       SET name = $1, brand = $2, total_limit = $3, closing_day = $4, due_day = $5
+       WHERE id = $6 RETURNING *`,
+      [name.trim(), brand.trim(), parsedLimit, parsedClosingDay, parsedDueDay, id]
+    );
+    await client.query('COMMIT');
+    return res.json(result.rows[0]);
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+router.delete('/api/credit-cards/:id', async (req: Request, res: Response): Promise<any> => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const cardResult = await client.query(
+      'SELECT id FROM credit_cards WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    if (cardResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Cartão não encontrado.' });
+    }
+
+    const pendingResult = await client.query(
+      "SELECT EXISTS (SELECT 1 FROM transactions WHERE credit_card_id = $1 AND status IS DISTINCT FROM 'PAID') AS has_pending_transactions",
+      [id]
+    );
+    if (pendingResult.rows[0].has_pending_transactions) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'O cartão possui lançamentos pendentes e não pode ser excluído.'
+      });
+    }
+
+    await client.query(
+      "UPDATE transactions SET credit_card_id = NULL WHERE credit_card_id = $1 AND status = 'PAID'",
+      [id]
+    );
+    await client.query('DELETE FROM credit_cards WHERE id = $1', [id]);
+    await client.query('COMMIT');
+    return res.json({ message: 'Cartão de crédito removido com sucesso.' });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // 6. TRANSAÇÕES / CONTAS A PAGAR E RECEBER
 router.get('/api/transactions', async (req: Request, res: Response): Promise<any> => {
   const { family_id } = req.query;
@@ -251,6 +362,17 @@ router.post('/api/transactions', async (req: Request, res: Response): Promise<an
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    if (payment_method === 'CARD' && credit_card_id) {
+      const cardResult = await client.query(
+        'SELECT id FROM credit_cards WHERE id = $1 AND family_id = $2 FOR UPDATE',
+        [credit_card_id, family_id]
+      );
+      if (cardResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'O cartão selecionado não pertence a esta família.' });
+      }
+    }
+
     const totalInst = Math.max(1, Number(total_installments));
     const instAmount = Math.round((Number(amount) / totalInst) * 100) / 100;
 
