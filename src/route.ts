@@ -408,6 +408,69 @@ router.put('/api/transactions/:id', async (req: Request, res: Response): Promise
 });
 
 // --- APAGAR TRANSAÇÃO (COM LÓGICA DE PARCELAS) ---
+router.patch('/api/transactions/:id/pay', async (req: Request, res: Response): Promise<any> => {
+  const { id } = req.params;
+  const { account_id, paid_amount } = req.body;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const transactionResult = await client.query(
+      'SELECT id, family_id, amount, type, status, account_id FROM transactions WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    const transaction = transactionResult.rows[0];
+
+    if (!transaction) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Transação não encontrada.' });
+    }
+
+    if (transaction.status === 'PAID') {
+      await client.query('COMMIT');
+      return res.json({ message: 'Lançamento já está pago.', transaction });
+    }
+
+    const finalAmount = Number(paid_amount ?? transaction.amount);
+    if (!Number.isFinite(finalAmount) || finalAmount < Number(transaction.amount)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'O valor pago precisa cobrir o valor total do lançamento.' });
+    }
+
+    const accountId = account_id || transaction.account_id;
+    if (!accountId) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Selecione uma conta para registrar o pagamento.' });
+    }
+
+    const accountResult = await client.query(
+      'SELECT id FROM accounts WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [accountId, transaction.family_id]
+    );
+    if (accountResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'A conta selecionada não pertence à família deste lançamento.' });
+    }
+
+    const balanceChange = transaction.type === 'INCOME' ? finalAmount : -finalAmount;
+    await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [balanceChange, accountId]);
+
+    const updatedTransaction = await client.query(
+      "UPDATE transactions SET status = 'PAID', account_id = $2 WHERE id = $1 RETURNING *",
+      [id, accountId]
+    );
+
+    await client.query('COMMIT');
+    return res.json({ message: 'Lançamento baixado com sucesso.', transaction: updatedTransaction.rows[0] });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 router.delete('/api/transactions/:id', async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const { scope, parent_id } = req.query; // scope pode ser 'single' (apenas esta) ou 'all' (todas da série)
