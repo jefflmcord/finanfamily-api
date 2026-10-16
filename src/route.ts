@@ -482,21 +482,44 @@ router.patch('/api/transactions/:id/pay', async (req: Request, res: Response): P
 router.delete('/api/transactions/:id', async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const { scope, parent_id } = req.query; // scope pode ser 'single' (apenas esta) ou 'all' (todas da série)
+  const deleteSeries = scope === 'all' && parent_id && parent_id !== 'null';
+  const transactionFilter = deleteSeries
+    ? 'id = $1 OR parent_transaction_id = $1 OR id = $2 OR parent_transaction_id = $2'
+    : 'id = $1';
+  const transactionParams = deleteSeries ? [parent_id, id] : [id];
+  const client = await pool.connect();
 
   try {
-    if (scope === 'all' && parent_id && parent_id !== 'null') {
-      // Apaga a transação original (pai) e todas as suas parcelas filhas
-      await pool.query(
-        `DELETE FROM transactions WHERE id = $1 OR parent_transaction_id = $1 OR id = $2 OR parent_transaction_id = $2`,
-        [parent_id, id]
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT id FROM transactions WHERE ${transactionFilter} FOR UPDATE`,
+      transactionParams
+    );
+
+    const paidExpenseBalances = await client.query(
+      `SELECT account_id, family_id, SUM(amount) AS amount_to_restore
+       FROM transactions
+       WHERE (${transactionFilter}) AND type = 'EXPENSE' AND status = 'PAID' AND account_id IS NOT NULL
+       GROUP BY account_id, family_id
+       ORDER BY account_id`,
+      transactionParams
+    );
+
+    for (const transaction of paidExpenseBalances.rows) {
+      await client.query(
+        'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
+        [transaction.amount_to_restore, transaction.account_id, transaction.family_id]
       );
-    } else {
-      // Apaga apenas esta transação isolada
-      await pool.query(`DELETE FROM transactions WHERE id = $1`, [id]);
     }
+
+    await client.query(`DELETE FROM transactions WHERE ${transactionFilter}`, transactionParams);
+    await client.query('COMMIT');
     return res.json({ message: 'Transação apagada com sucesso.' });
   } catch (err: any) {
+    await client.query('ROLLBACK');
     return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 export default router;
