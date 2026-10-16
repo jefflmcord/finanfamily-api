@@ -83,6 +83,14 @@ export async function initializeAccessControl(): Promise<void> {
       ADD COLUMN IF NOT EXISTS bio VARCHAR(280)
   `);
   await pool.query(`
+    ALTER TABLE families
+      ADD COLUMN IF NOT EXISTS registered_at TIMESTAMPTZ
+  `);
+  await pool.query(`
+    ALTER TABLE families
+      ALTER COLUMN registered_at SET DEFAULT NOW()
+  `);
+  await pool.query(`
     DO $$
     BEGIN
       IF to_regclass('family_budgets') IS NOT NULL THEN
