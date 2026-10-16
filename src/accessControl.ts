@@ -72,6 +72,23 @@ export async function initializeAccessControl(): Promise<void> {
       ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'BOLETO'
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS family_budgets (
+      id BIGSERIAL PRIMARY KEY,
+      family_id TEXT NOT NULL,
+      category_id TEXT NOT NULL,
+      year INTEGER NOT NULL,
+      month INTEGER NOT NULL CHECK (month BETWEEN 1 AND 12),
+      amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (family_id, category_id, year, month)
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS family_budgets_period_idx
+      ON family_budgets (family_id, year, month)
+  `);
+  await pool.query(`
     UPDATE transactions
     SET payment_method = 'CARD'
     WHERE credit_card_id IS NOT NULL AND payment_method <> 'CARD'
