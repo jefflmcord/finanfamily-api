@@ -1,8 +1,15 @@
-import { Router, Request, Response, NextFunction } from 'express';
+import { Router, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { OAuth2Client } from 'google-auth-library';
-import { pool } from './server';
+import { pool } from './database';
+import familyRouter, { publicFamilyRouter } from './familyRoutes';
+import {
+  authenticateFamilyMember,
+  FAMILY_PERMISSIONS,
+  hashInvitationToken,
+  requireFamilyPermission,
+} from './accessControl';
 
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
@@ -13,19 +20,6 @@ const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 router.get('/', (req: Request, res: Response) => {
   return res.status(200).json({ status: 'online', message: 'API FinanFamily a funcionar perfeitamente!' });
 });
-
-// Middleware de Autenticação
-const authenticateToken = (req: any, res: Response, next: NextFunction): any => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Acesso negado. Token ausente.' });
-
-  jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
-    if (err) return res.status(403).json({ error: 'Token inválido ou expirado.' });
-    req.user = user;
-    next();
-  });
-};
 
 // Função auxiliar para garantir que a categoria "Investimento" existe para a família
 async function ensureInvestmentCategory(client: any, familyId: string | number) {
@@ -86,6 +80,7 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
   const { credential } = req.body;
   if (!credential) return res.status(400).json({ error: 'Token do Google não fornecido.' });
 
+  const client = await pool.connect();
   try {
     const ticket = await googleClient.verifyIdToken({
       idToken: credential,
@@ -99,41 +94,118 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
 
     const { email, name, sub: googleId, picture: avatarUrl } = payload;
     const cleanEmail = email.toLowerCase();
+    const invitationToken = typeof req.body.invitation_token === 'string' ? req.body.invitation_token : '';
+    await client.query('BEGIN');
+    const invitationResult = invitationToken
+      ? await client.query(
+          `SELECT token_hash, family_id, email, permissions, invited_by
+           FROM family_invitations
+           WHERE token_hash = $1 AND accepted_at IS NULL AND expires_at > NOW()
+           FOR UPDATE`,
+          [hashInvitationToken(invitationToken)]
+        )
+      : { rows: [] };
+    const invitation = invitationResult.rows[0];
+    if (invitationToken && (!invitation || invitation.email !== cleanEmail)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'O convite não é válido para esta conta Google ou expirou.' });
+    }
 
-    let result = await pool.query('SELECT * FROM users WHERE email = $1', [cleanEmail]);
-    let user = result.rows[0];
+    const existingUserResult = await client.query(
+      'SELECT id, name, email, family_id, avatar_url, google_id FROM users WHERE LOWER(email) = $1 FOR UPDATE',
+      [cleanEmail]
+    );
+    let user = existingUserResult.rows[0];
+    if (user && invitation && user.family_id && String(user.family_id) !== String(invitation.family_id)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Esta conta já pertence a outra família. Ainda não é possível vincular uma conta a múltiplas famílias.' });
+    }
 
     if (user) {
-      if (!user.google_id) {
-        const updateResult = await pool.query(
-          'UPDATE users SET google_id = $1, avatar_url = $2, email_verified = TRUE WHERE id = $3 RETURNING *',
-          [googleId, avatarUrl, user.id]
+      if (!user.google_id || !user.avatar_url) {
+        const updateResult = await client.query(
+          `UPDATE users
+           SET google_id = COALESCE(google_id, $1), avatar_url = COALESCE($2, avatar_url), email_verified = TRUE
+           WHERE id = $3
+           RETURNING id, name, email, family_id, avatar_url, google_id`,
+          [googleId, avatarUrl || null, user.id]
         );
         user = updateResult.rows[0];
       }
-    } else {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        const familyRes = await client.query('INSERT INTO families (name) VALUES ($1) RETURNING id', [`Família de ${name || 'Utilizador'}`]);
-        const familyId = familyRes.rows[0].id;
-
-        await client.query('INSERT INTO accounts (family_id, name, balance) VALUES ($1, $2, $3)', [familyId, 'Conta Principal', 0]);
-        await client.query('INSERT INTO categories (family_id, name, flow_type) VALUES ($1, $2, $3)', [familyId, 'Investimento', 'EXPENSE']);
-
-        const userRes = await client.query(
-          `INSERT INTO users (name, email, google_id, avatar_url, family_id, email_verified) VALUES ($1, $2, $3, $4, $5, TRUE) RETURNING id, name, email, family_id, avatar_url`,
-          [name || 'Utilizador', cleanEmail, googleId, avatarUrl || null, familyId]
+      if (invitation) {
+        if (!user.family_id) {
+          const familyUpdate = await client.query(
+            'UPDATE users SET family_id = $1 WHERE id = $2 RETURNING id, name, email, family_id, avatar_url, google_id',
+            [invitation.family_id, user.id]
+          );
+          user = familyUpdate.rows[0];
+        }
+        const membershipResult = await client.query(
+          'SELECT family_id, role FROM family_members WHERE user_id = $1 FOR UPDATE',
+          [String(user.id)]
         );
-        user = userRes.rows[0];
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-      } finally {
-        client.release();
+        const membership = membershipResult.rows[0];
+        if (membership && String(membership.family_id) !== String(invitation.family_id)) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({ error: 'Esta conta já está vinculada a outra família.' });
+        }
+        if (!membership) {
+          await client.query(
+            `INSERT INTO family_members (family_id, user_id, role, permissions, invited_by)
+             VALUES ($1, $2, 'MEMBER', $3::jsonb, $4)`,
+            [String(invitation.family_id), String(user.id), JSON.stringify(invitation.permissions), String(invitation.invited_by)]
+          );
+        }
       }
+    } else if (invitation) {
+      const userRes = await client.query(
+        `INSERT INTO users (name, email, google_id, avatar_url, family_id, email_verified)
+         VALUES ($1, $2, $3, $4, $5, TRUE)
+         RETURNING id, name, email, family_id, avatar_url`,
+        [name || 'Utilizador', cleanEmail, googleId, avatarUrl || null, invitation.family_id]
+      );
+      user = userRes.rows[0];
+      await client.query(
+        `INSERT INTO family_members (family_id, user_id, role, permissions, invited_by)
+         VALUES ($1, $2, 'MEMBER', $3::jsonb, $4)`,
+        [String(invitation.family_id), String(user.id), JSON.stringify(invitation.permissions), String(invitation.invited_by)]
+      );
+    } else {
+      const familyRes = await client.query(
+        'INSERT INTO families (name) VALUES ($1) RETURNING id',
+        [`Família de ${name || 'Utilizador'}`]
+      );
+      const familyId = familyRes.rows[0].id;
+      await client.query(
+        'INSERT INTO accounts (family_id, name, balance) VALUES ($1, $2, $3)',
+        [familyId, 'Conta Principal', 0]
+      );
+      await client.query(
+        'INSERT INTO categories (family_id, name, flow_type) VALUES ($1, $2, $3)',
+        [familyId, 'Investimento', 'EXPENSE']
+      );
+      const userRes = await client.query(
+        `INSERT INTO users (name, email, google_id, avatar_url, family_id, email_verified)
+         VALUES ($1, $2, $3, $4, $5, TRUE)
+         RETURNING id, name, email, family_id, avatar_url`,
+        [name || 'Utilizador', cleanEmail, googleId, avatarUrl || null, familyId]
+      );
+      user = userRes.rows[0];
+      const ownerPermissions = Object.fromEntries(FAMILY_PERMISSIONS.map(permission => [permission, true]));
+      await client.query(
+        `INSERT INTO family_members (family_id, user_id, role, permissions)
+         VALUES ($1, $2, 'OWNER', $3::jsonb)`,
+        [String(familyId), String(user.id), JSON.stringify(ownerPermissions)]
+      );
     }
+
+    if (invitation) {
+      await client.query(
+        'UPDATE family_invitations SET accepted_at = NOW() WHERE token_hash = $1',
+        [invitation.token_hash]
+      );
+    }
+    await client.query('COMMIT');
 
     const token = jwt.sign(
       { id: user.id, family_id: user.family_id },
@@ -141,17 +213,24 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
       { expiresIn: '7d' }
     );
 
-    return res.status(200).json({ token, user });
+    const { password_hash, verification_token, reset_token, ...safeUser } = user;
+    return res.status(200).json({ token, user: safeUser });
   } catch (err: any) {
+    await client.query('ROLLBACK');
     console.error('Erro no Google Auth:', err);
     return res.status(500).json({ error: 'Erro ao autenticar com o Google.' });
+  } finally {
+    client.release();
   }
 });
 
+router.use(publicFamilyRouter);
+router.use('/api', authenticateFamilyMember);
+router.use(familyRouter);
+
 // 3. CONTAS BANCÁRIAS
-router.get('/api/accounts', async (req: Request, res: Response): Promise<any> => {
-  const { family_id } = req.query;
-  if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
+router.get('/api/accounts', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {
+  const family_id = req.familyAccess!.familyId;
 
   try {
     const result = await pool.query(
@@ -165,9 +244,8 @@ router.get('/api/accounts', async (req: Request, res: Response): Promise<any> =>
 });
 
 // 4. CATEGORIAS
-router.get('/api/categories', async (req: Request, res: Response): Promise<any> => {
-  const { family_id } = req.query;
-  if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
+router.get('/api/categories', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {
+  const family_id = req.familyAccess!.familyId;
 
   const client = await pool.connect();
   try {
@@ -192,8 +270,9 @@ router.get('/api/categories', async (req: Request, res: Response): Promise<any> 
   }
 });
 
-router.post('/api/categories', async (req: Request, res: Response): Promise<any> => {
-  const { family_id, name, type = 'VARIABLE', flow_type = 'EXPENSE', color = '#10b981' } = req.body;
+router.post('/api/categories', requireFamilyPermission('categories_manage'), async (req: Request, res: Response): Promise<any> => {
+  const { name, type = 'VARIABLE', flow_type = 'EXPENSE', color = '#10b981' } = req.body;
+  const family_id = req.familyAccess!.familyId;
   const normalizedName = typeof name === 'string' ? name.trim() : '';
   if (!family_id || !normalizedName) {
     return res.status(400).json({ error: 'family_id e name são obrigatórios.' });
@@ -217,7 +296,7 @@ router.post('/api/categories', async (req: Request, res: Response): Promise<any>
   }
 });
 
-router.put('/api/categories/:id', async (req: Request, res: Response): Promise<any> => {
+router.put('/api/categories/:id', requireFamilyPermission('categories_manage'), async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const { name, type, flow_type, color } = req.body;
   const normalizedName = typeof name === 'string' ? name.trim() : '';
@@ -233,8 +312,8 @@ router.put('/api/categories/:id', async (req: Request, res: Response): Promise<a
   try {
     await client.query('BEGIN');
     const categoryResult = await client.query(
-      'SELECT id, name, flow_type FROM categories WHERE id = $1 FOR UPDATE',
-      [id]
+      'SELECT id, name, flow_type FROM categories WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [id, req.familyAccess!.familyId]
     );
     const category = categoryResult.rows[0];
     if (!category) {
@@ -259,8 +338,8 @@ router.put('/api/categories/:id', async (req: Request, res: Response): Promise<a
 
     const result = await client.query(
       `UPDATE categories SET name = $1, type = $2, flow_type = $3, color = $4
-       WHERE id = $5 RETURNING *`,
-      [normalizedName, type, flow_type, color, id]
+       WHERE id = $5 AND family_id = $6 RETURNING *`,
+      [normalizedName, type, flow_type, color, id, req.familyAccess!.familyId]
     );
     await client.query('COMMIT');
     return res.json(result.rows[0]);
@@ -272,14 +351,14 @@ router.put('/api/categories/:id', async (req: Request, res: Response): Promise<a
   }
 });
 
-router.delete('/api/categories/:id', async (req: Request, res: Response): Promise<any> => {
+router.delete('/api/categories/:id', requireFamilyPermission('categories_manage'), async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const categoryResult = await client.query(
-      'SELECT id, name FROM categories WHERE id = $1 FOR UPDATE',
-      [id]
+      'SELECT id, name FROM categories WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [id, req.familyAccess!.familyId]
     );
     const category = categoryResult.rows[0];
     if (!category) {
@@ -303,7 +382,7 @@ router.delete('/api/categories/:id', async (req: Request, res: Response): Promis
       });
     }
 
-    await client.query('DELETE FROM categories WHERE id = $1', [id]);
+    await client.query('DELETE FROM categories WHERE id = $1 AND family_id = $2', [id, req.familyAccess!.familyId]);
     await client.query('COMMIT');
     return res.json({ message: 'Categoria excluída com sucesso.' });
   } catch (err: any) {
@@ -315,9 +394,8 @@ router.delete('/api/categories/:id', async (req: Request, res: Response): Promis
 });
 
 // 5. CARTÕES DE CRÉDITO
-router.get('/api/credit-cards', async (req: Request, res: Response): Promise<any> => {
-  const { family_id } = req.query;
-  if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
+router.get('/api/credit-cards', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {
+  const family_id = req.familyAccess!.familyId;
 
   try {
     const result = await pool.query(`SELECT * FROM credit_cards WHERE family_id = $1 ORDER BY name ASC`, [String(family_id)]);
@@ -327,8 +405,9 @@ router.get('/api/credit-cards', async (req: Request, res: Response): Promise<any
   }
 });
 
-router.post('/api/credit-cards', async (req: Request, res: Response): Promise<any> => {
-  const { family_id, name, brand, total_limit, closing_day, due_day } = req.body;
+router.post('/api/credit-cards', requireFamilyPermission('cards_manage'), async (req: Request, res: Response): Promise<any> => {
+  const { name, brand, total_limit, closing_day, due_day } = req.body;
+  const family_id = req.familyAccess!.familyId;
   const parsedLimit = Number(total_limit) || 0;
 
   if (!family_id || !name || !brand || parsedLimit <= 0) {
@@ -347,7 +426,7 @@ router.post('/api/credit-cards', async (req: Request, res: Response): Promise<an
   }
 });
 
-router.put('/api/credit-cards/:id', async (req: Request, res: Response): Promise<any> => {
+router.put('/api/credit-cards/:id', requireFamilyPermission('cards_manage'), async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const { name, brand, total_limit, closing_day, due_day } = req.body;
   const parsedLimit = Number(total_limit);
@@ -359,8 +438,8 @@ router.put('/api/credit-cards/:id', async (req: Request, res: Response): Promise
   try {
     await client.query('BEGIN');
     const cardResult = await client.query(
-      'SELECT id FROM credit_cards WHERE id = $1 FOR UPDATE',
-      [id]
+      'SELECT id FROM credit_cards WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [id, req.familyAccess!.familyId]
     );
     if (cardResult.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -383,8 +462,8 @@ router.put('/api/credit-cards/:id', async (req: Request, res: Response): Promise
       }
 
       const result = await client.query(
-        'UPDATE credit_cards SET total_limit = $1 WHERE id = $2 RETURNING *',
-        [parsedLimit, id]
+        'UPDATE credit_cards SET total_limit = $1 WHERE id = $2 AND family_id = $3 RETURNING *',
+        [parsedLimit, id, req.familyAccess!.familyId]
       );
       await client.query('COMMIT');
       return res.json(result.rows[0]);
@@ -405,8 +484,8 @@ router.put('/api/credit-cards/:id', async (req: Request, res: Response): Promise
     const result = await client.query(
       `UPDATE credit_cards
        SET name = $1, brand = $2, total_limit = $3, closing_day = $4, due_day = $5
-       WHERE id = $6 RETURNING *`,
-      [name.trim(), brand.trim(), parsedLimit, parsedClosingDay, parsedDueDay, id]
+       WHERE id = $6 AND family_id = $7 RETURNING *`,
+      [name.trim(), brand.trim(), parsedLimit, parsedClosingDay, parsedDueDay, id, req.familyAccess!.familyId]
     );
     await client.query('COMMIT');
     return res.json(result.rows[0]);
@@ -418,14 +497,14 @@ router.put('/api/credit-cards/:id', async (req: Request, res: Response): Promise
   }
 });
 
-router.delete('/api/credit-cards/:id', async (req: Request, res: Response): Promise<any> => {
+router.delete('/api/credit-cards/:id', requireFamilyPermission('cards_manage'), async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const cardResult = await client.query(
-      'SELECT id FROM credit_cards WHERE id = $1 FOR UPDATE',
-      [id]
+      'SELECT id FROM credit_cards WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [id, req.familyAccess!.familyId]
     );
     if (cardResult.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -444,10 +523,10 @@ router.delete('/api/credit-cards/:id', async (req: Request, res: Response): Prom
     }
 
     await client.query(
-      "UPDATE transactions SET credit_card_id = NULL WHERE credit_card_id = $1 AND status = 'PAID'",
-      [id]
+      "UPDATE transactions SET credit_card_id = NULL WHERE credit_card_id = $1 AND family_id = $2 AND status = 'PAID'",
+      [id, req.familyAccess!.familyId]
     );
-    await client.query('DELETE FROM credit_cards WHERE id = $1', [id]);
+    await client.query('DELETE FROM credit_cards WHERE id = $1 AND family_id = $2', [id, req.familyAccess!.familyId]);
     await client.query('COMMIT');
     return res.json({ message: 'Cartão de crédito removido com sucesso.' });
   } catch (err: any) {
@@ -459,9 +538,8 @@ router.delete('/api/credit-cards/:id', async (req: Request, res: Response): Prom
 });
 
 // 6. TRANSAÇÕES / CONTAS A PAGAR E RECEBER
-router.get('/api/transactions', async (req: Request, res: Response): Promise<any> => {
-  const { family_id } = req.query;
-  if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
+router.get('/api/transactions', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {
+  const family_id = req.familyAccess!.familyId;
 
   try {
     const result = await pool.query(
@@ -479,9 +557,8 @@ router.get('/api/transactions', async (req: Request, res: Response): Promise<any
   }
 });
 
-router.post('/api/transactions', async (req: Request, res: Response): Promise<any> => {
+router.post('/api/transactions', requireFamilyPermission('transactions_create'), async (req: Request, res: Response): Promise<any> => {
   const {
-    family_id,
     account_id,
     credit_card_id,
     category_id,
@@ -495,9 +572,13 @@ router.post('/api/transactions', async (req: Request, res: Response): Promise<an
     start_installment = 1,
     payment_method = 'BOLETO'
   } = req.body;
+  const family_id = req.familyAccess!.familyId;
 
   if (!family_id || !description || !amount || !transaction_date || !due_date || !type) {
     return res.status(400).json({ error: 'family_id, description, amount, transaction_date, due_date e type são obrigatórios.' });
+  }
+  if (status !== 'PENDING') {
+    return res.status(400).json({ error: 'Novos lançamentos devem começar pendentes. Use a ação de baixa para registrar o pagamento.' });
   }
 
   const client = await pool.connect();
@@ -578,9 +659,8 @@ router.post('/api/transactions', async (req: Request, res: Response): Promise<an
 });
 
 // 7. METAS / OBJETIVOS
-router.get('/api/goals', async (req: Request, res: Response): Promise<any> => {
-  const { family_id } = req.query;
-  if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
+router.get('/api/goals', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {
+  const family_id = req.familyAccess!.familyId;
 
   try {
     const result = await pool.query(`SELECT * FROM goals WHERE family_id = $1 ORDER BY created_at DESC`, [String(family_id)]);
@@ -590,8 +670,9 @@ router.get('/api/goals', async (req: Request, res: Response): Promise<any> => {
   }
 });
 
-router.post('/api/goals', async (req: Request, res: Response): Promise<any> => {
-  const { family_id, title, target_amount, months } = req.body;
+router.post('/api/goals', requireFamilyPermission('goals_manage'), async (req: Request, res: Response): Promise<any> => {
+  const { title, target_amount, months } = req.body;
+  const family_id = req.familyAccess!.familyId;
   if (!family_id || !title || !target_amount || !months) {
     return res.status(400).json({ error: 'family_id, title, target_amount e months são obrigatórios.' });
   }
@@ -654,20 +735,33 @@ router.post('/api/goals', async (req: Request, res: Response): Promise<any> => {
   }
 });
 // --- EDITAR TRANSAÇÃO ---
-router.put('/api/transactions/:id', async (req: Request, res: Response): Promise<any> => {
+router.put('/api/transactions/:id', requireFamilyPermission('transactions_edit'), async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const { description, amount, due_date, status, category_id, account_id, payment_method } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const transactionResult = await client.query(
-      'SELECT family_id, type FROM transactions WHERE id = $1 FOR UPDATE',
-      [id]
+      'SELECT family_id, type, status, amount, account_id FROM transactions WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [id, req.familyAccess!.familyId]
     );
     const transaction = transactionResult.rows[0];
     if (!transaction) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Transação não encontrada.' });
+    }
+
+    const nextStatus = status ?? transaction.status;
+    if (nextStatus !== transaction.status) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Use as ações de baixa ou estorno para alterar o status do lançamento.' });
+    }
+    const parsedAmount = Number(amount);
+    if (typeof description !== 'string' || !description.trim() ||
+        !Number.isFinite(parsedAmount) || parsedAmount <= 0 ||
+        typeof due_date !== 'string' || !due_date) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Informe descrição, valor e vencimento válidos.' });
     }
 
     if (category_id) {
@@ -681,19 +775,65 @@ router.put('/api/transactions/:id', async (req: Request, res: Response): Promise
       }
     }
 
+    const nextAccountId = payment_method === 'CARD' && transaction.status !== 'PAID'
+      ? null
+      : account_id || transaction.account_id || null;
+    if (nextAccountId) {
+      const accountResult = await client.query(
+        'SELECT id FROM accounts WHERE id = $1 AND family_id = $2 FOR UPDATE',
+        [nextAccountId, req.familyAccess!.familyId]
+      );
+      if (accountResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'A conta selecionada não pertence a esta família.' });
+      }
+    }
+
+    if (transaction.status === 'PAID' &&
+        (Number(transaction.amount) !== parsedAmount || String(transaction.account_id) !== String(nextAccountId))) {
+      if (!transaction.account_id || !nextAccountId) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Não é possível ajustar o saldo de um lançamento pago sem uma conta vinculada.' });
+      }
+      const previousAccountResult = await client.query(
+        'SELECT id FROM accounts WHERE id = $1 AND family_id = $2 FOR UPDATE',
+        [transaction.account_id, req.familyAccess!.familyId]
+      );
+      if (previousAccountResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'A conta vinculada ao lançamento pago não pertence mais a esta família.' });
+      }
+      const balanceSign = transaction.type === 'INCOME' ? 1 : -1;
+      if (String(transaction.account_id) === String(nextAccountId)) {
+        await client.query(
+          'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
+          [balanceSign * (parsedAmount - Number(transaction.amount)), nextAccountId, req.familyAccess!.familyId]
+        );
+      } else {
+        await client.query(
+          'UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND family_id = $3',
+          [balanceSign * Number(transaction.amount), transaction.account_id, req.familyAccess!.familyId]
+        );
+        await client.query(
+          'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
+          [balanceSign * parsedAmount, nextAccountId, req.familyAccess!.familyId]
+        );
+      }
+    }
+
     const result = await client.query(
-      `UPDATE transactions 
-       SET description = $1, amount = $2, due_date = $3, status = $4, category_id = $5, account_id = $6, payment_method = $7 
-       WHERE id = $8 RETURNING *`,
+      `UPDATE transactions
+       SET description = $1, amount = $2, due_date = $3, category_id = $4, account_id = $5, payment_method = $6
+       WHERE id = $7 AND family_id = $8 RETURNING *`,
       [
-        description, 
-        amount, 
-        due_date, 
-        status, 
-        category_id || null, 
-        payment_method === 'CARD' ? null : (account_id || null), 
+        description.trim(),
+        parsedAmount,
+        due_date,
+        category_id || null,
+        nextAccountId,
         payment_method || 'BOLETO',
-        id
+        id,
+        req.familyAccess!.familyId
       ]
     );
     await client.query('COMMIT');
@@ -707,7 +847,7 @@ router.put('/api/transactions/:id', async (req: Request, res: Response): Promise
 });
 
 // --- APAGAR TRANSAÇÃO (COM LÓGICA DE PARCELAS) ---
-router.patch('/api/transactions/:id/pay', async (req: Request, res: Response): Promise<any> => {
+router.patch('/api/transactions/:id/pay', requireFamilyPermission('transactions_settle'), async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const { account_id, paid_amount } = req.body;
   const client = await pool.connect();
@@ -716,8 +856,8 @@ router.patch('/api/transactions/:id/pay', async (req: Request, res: Response): P
     await client.query('BEGIN');
 
     const transactionResult = await client.query(
-      'SELECT id, family_id, amount, type, status, account_id FROM transactions WHERE id = $1 FOR UPDATE',
-      [id]
+      'SELECT id, family_id, amount, type, status, account_id FROM transactions WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [id, req.familyAccess!.familyId]
     );
     const transaction = transactionResult.rows[0];
 
@@ -732,9 +872,9 @@ router.patch('/api/transactions/:id/pay', async (req: Request, res: Response): P
     }
 
     const finalAmount = Number(paid_amount ?? transaction.amount);
-    if (!Number.isFinite(finalAmount) || finalAmount < Number(transaction.amount)) {
+    if (!Number.isFinite(finalAmount) || finalAmount !== Number(transaction.amount)) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'O valor pago precisa cobrir o valor total do lançamento.' });
+      return res.status(400).json({ error: 'O valor pago deve corresponder ao valor total do lançamento.' });
     }
 
     let accountId = account_id || transaction.account_id;
@@ -761,11 +901,14 @@ router.patch('/api/transactions/:id/pay', async (req: Request, res: Response): P
     }
 
     const balanceChange = transaction.type === 'INCOME' ? finalAmount : -finalAmount;
-    await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [balanceChange, accountId]);
+    await client.query(
+      'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
+      [balanceChange, accountId, req.familyAccess!.familyId]
+    );
 
     const updatedTransaction = await client.query(
-      "UPDATE transactions SET status = 'PAID', account_id = $2 WHERE id = $1 RETURNING *",
-      [id, accountId]
+      "UPDATE transactions SET status = 'PAID', account_id = $2 WHERE id = $1 AND family_id = $3 RETURNING *",
+      [id, accountId, req.familyAccess!.familyId]
     );
 
     await client.query('COMMIT');
@@ -778,7 +921,60 @@ router.patch('/api/transactions/:id/pay', async (req: Request, res: Response): P
   }
 });
 
-router.delete('/api/transactions/:id', async (req: Request, res: Response): Promise<any> => {
+router.patch('/api/transactions/:id/unpay', requireFamilyPermission('transactions_settle'), async (req: Request, res: Response): Promise<any> => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const transactionResult = await client.query(
+      'SELECT id, family_id, amount, type, status, account_id FROM transactions WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [id, req.familyAccess!.familyId]
+    );
+    const transaction = transactionResult.rows[0];
+    if (!transaction) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Transação não encontrada.' });
+    }
+    if (transaction.status !== 'PAID') {
+      await client.query('COMMIT');
+      return res.json({ message: 'Lançamento já está pendente.', transaction });
+    }
+    if (!transaction.account_id) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Não é possível estornar este lançamento porque ele não possui uma conta vinculada.' });
+    }
+
+    const accountResult = await client.query(
+      'SELECT id FROM accounts WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [transaction.account_id, req.familyAccess!.familyId]
+    );
+    if (accountResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'A conta vinculada ao lançamento não pertence mais a esta família.' });
+    }
+
+    const balanceChange = transaction.type === 'INCOME'
+      ? -Number(transaction.amount)
+      : Number(transaction.amount);
+    await client.query(
+      'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
+      [balanceChange, transaction.account_id, req.familyAccess!.familyId]
+    );
+    const updatedTransaction = await client.query(
+      "UPDATE transactions SET status = 'PENDING' WHERE id = $1 AND family_id = $2 RETURNING *",
+      [id, req.familyAccess!.familyId]
+    );
+    await client.query('COMMIT');
+    return res.json({ message: 'Baixa estornada com sucesso.', transaction: updatedTransaction.rows[0] });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+router.delete('/api/transactions/:id', requireFamilyPermission('transactions_delete'), async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const { scope, parent_id } = req.query; // scope pode ser 'single' (apenas esta) ou 'all' (todas da série)
   const deleteSeries = scope === 'all' && parent_id && parent_id !== 'null';
@@ -791,27 +987,34 @@ router.delete('/api/transactions/:id', async (req: Request, res: Response): Prom
   try {
     await client.query('BEGIN');
     await client.query(
-      `SELECT id FROM transactions WHERE ${transactionFilter} FOR UPDATE`,
-      transactionParams
+      `SELECT id FROM transactions WHERE (${transactionFilter}) AND family_id = $${transactionParams.length + 1} FOR UPDATE`,
+      [...transactionParams, req.familyAccess!.familyId]
     );
 
-    const paidExpenseBalances = await client.query(
-      `SELECT account_id, family_id, SUM(amount) AS amount_to_restore
+    const paidTransactionBalances = await client.query(
+      `SELECT account_id, family_id, type, SUM(amount) AS amount_to_restore
        FROM transactions
-       WHERE (${transactionFilter}) AND type = 'EXPENSE' AND status = 'PAID' AND account_id IS NOT NULL
-       GROUP BY account_id, family_id
+       WHERE (${transactionFilter}) AND family_id = $${transactionParams.length + 1}
+         AND type IN ('EXPENSE', 'INCOME') AND status = 'PAID' AND account_id IS NOT NULL
+       GROUP BY account_id, family_id, type
        ORDER BY account_id`,
-      transactionParams
+      [...transactionParams, req.familyAccess!.familyId]
     );
 
-    for (const transaction of paidExpenseBalances.rows) {
+    for (const transaction of paidTransactionBalances.rows) {
+      const balanceChange = transaction.type === 'INCOME'
+        ? -Number(transaction.amount_to_restore)
+        : Number(transaction.amount_to_restore);
       await client.query(
         'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
-        [transaction.amount_to_restore, transaction.account_id, transaction.family_id]
+        [balanceChange, transaction.account_id, transaction.family_id]
       );
     }
 
-    await client.query(`DELETE FROM transactions WHERE ${transactionFilter}`, transactionParams);
+    await client.query(
+      `DELETE FROM transactions WHERE (${transactionFilter}) AND family_id = $${transactionParams.length + 1}`,
+      [...transactionParams, req.familyAccess!.familyId]
+    );
     await client.query('COMMIT');
     return res.json({ message: 'Transação apagada com sucesso.' });
   } catch (err: any) {

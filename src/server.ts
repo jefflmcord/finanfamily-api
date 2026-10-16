@@ -1,8 +1,9 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { Pool } from 'pg';
 import router from './route';
+import { initializeAccessControl } from './accessControl';
+import { pool } from './database';
 
 dotenv.config();
 
@@ -11,17 +12,20 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Configuração da Ligação à Base de Dados PostgreSQL (Neon)
-export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+export { pool };
 
 // Registar as rotas unificadas
 app.use(router);
 
 const PORT = process.env.PORT || 4000;
 
-app.listen(PORT, () => {
-  console.log(`Servidor FinanFamily rodando na porta ${PORT}`);
-});
+initializeAccessControl()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Servidor FinanFamily rodando na porta ${PORT}`);
+    });
+  })
+  .catch((error: unknown) => {
+    console.error('Falha ao preparar permissões familiares:', error);
+    process.exit(1);
+  });
