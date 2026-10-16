@@ -151,7 +151,7 @@ router.get('/api/accounts', async (req: Request, res: Response): Promise<any> =>
 
   try {
     const result = await pool.query(
-      `SELECT id, name, balance, color FROM accounts WHERE family_id = $1 ORDER BY name ASC`,
+      `SELECT id, name, balance FROM accounts WHERE family_id = $1 ORDER BY name ASC`,
       [String(family_id)]
     );
     return res.json(result.rows);
