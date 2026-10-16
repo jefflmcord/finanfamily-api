@@ -396,6 +396,9 @@ router.get('/api/categories', requireFamilyPermission('family_read'), async (req
 
 router.post('/api/categories', requireFamilyPermission('categories_manage'), async (req: Request, res: Response): Promise<any> => {
   const { name, type = 'VARIABLE', flow_type = 'EXPENSE', color = '#10b981' } = req.body;
+  const budgetAmount = req.body.budget_amount === '' || req.body.budget_amount === null || req.body.budget_amount === undefined
+    ? null
+    : Number(req.body.budget_amount);
   const family_id = req.familyAccess!.familyId;
   const normalizedName = typeof name === 'string' ? name.trim() : '';
   if (!family_id || !normalizedName) {
@@ -404,15 +407,18 @@ router.post('/api/categories', requireFamilyPermission('categories_manage'), asy
   if (!['EXPENSE', 'INCOME'].includes(flow_type) || !['FIXED', 'VARIABLE'].includes(type)) {
     return res.status(400).json({ error: 'Tipo e fluxo da categoria são inválidos.' });
   }
+  if (budgetAmount !== null && (!Number.isFinite(budgetAmount) || budgetAmount <= 0 || flow_type !== 'EXPENSE')) {
+    return res.status(400).json({ error: 'O orçamento deve ser maior que zero e só pode ser definido para categorias de despesa.' });
+  }
   if (normalizedName.toLocaleLowerCase('pt-BR') === 'investimento') {
     return res.status(409).json({ error: 'A categoria Investimento já é pré-cadastrada e reservada.' });
   }
 
   try {
     const result = await pool.query(
-      `INSERT INTO categories (family_id, name, type, flow_type, color)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [family_id, normalizedName, type, flow_type, color]
+      `INSERT INTO categories (family_id, name, type, flow_type, color, budget_amount)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [family_id, normalizedName, type, flow_type, color, budgetAmount]
     );
     return res.status(201).json(result.rows[0]);
   } catch (err: any) {
@@ -423,10 +429,18 @@ router.post('/api/categories', requireFamilyPermission('categories_manage'), asy
 router.put('/api/categories/:id', requireFamilyPermission('categories_manage'), async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const { name, type, flow_type, color } = req.body;
+  const hasBudgetAmount = Object.prototype.hasOwnProperty.call(req.body, 'budget_amount');
+  const budgetAmount = req.body.budget_amount === '' || req.body.budget_amount === null || req.body.budget_amount === undefined
+    ? null
+    : Number(req.body.budget_amount);
   const normalizedName = typeof name === 'string' ? name.trim() : '';
   if (!normalizedName || !['FIXED', 'VARIABLE'].includes(type) ||
       !['EXPENSE', 'INCOME'].includes(flow_type) || typeof color !== 'string') {
     return res.status(400).json({ error: 'Nome, natureza, fluxo e cor da categoria são obrigatórios.' });
+  }
+  if (hasBudgetAmount && budgetAmount !== null &&
+      (!Number.isFinite(budgetAmount) || budgetAmount <= 0 || flow_type !== 'EXPENSE')) {
+    return res.status(400).json({ error: 'O orçamento deve ser maior que zero e só pode ser definido para categorias de despesa.' });
   }
   if (normalizedName.toLocaleLowerCase('pt-BR') === 'investimento') {
     return res.status(409).json({ error: 'A categoria Investimento é reservada e não pode ser renomeada.' });
@@ -461,9 +475,15 @@ router.put('/api/categories/:id', requireFamilyPermission('categories_manage'), 
     }
 
     const result = await client.query(
-      `UPDATE categories SET name = $1, type = $2, flow_type = $3, color = $4
-       WHERE id = $5 AND family_id = $6 RETURNING *`,
-      [normalizedName, type, flow_type, color, id, req.familyAccess!.familyId]
+      `UPDATE categories
+       SET name = $1, type = $2, flow_type = $3, color = $4,
+           budget_amount = CASE
+             WHEN $5::boolean THEN CASE WHEN $3 = 'EXPENSE' THEN $6::numeric ELSE NULL END
+             WHEN $3 = 'INCOME' THEN NULL
+             ELSE budget_amount
+           END
+       WHERE id = $7 AND family_id = $8 RETURNING *`,
+      [normalizedName, type, flow_type, color, hasBudgetAmount, budgetAmount, id, req.familyAccess!.familyId]
     );
     await client.query('COMMIT');
     return res.json(result.rows[0]);
@@ -506,10 +526,6 @@ router.delete('/api/categories/:id', requireFamilyPermission('categories_manage'
       });
     }
 
-    await client.query(
-      'DELETE FROM family_budgets WHERE category_id = $1 AND family_id = $2',
-      [String(id), req.familyAccess!.familyId]
-    );
     await client.query('DELETE FROM categories WHERE id = $1 AND family_id = $2', [id, req.familyAccess!.familyId]);
     await client.query('COMMIT');
     return res.json({ message: 'Categoria excluída com sucesso.' });
@@ -518,85 +534,6 @@ router.delete('/api/categories/:id', requireFamilyPermission('categories_manage'
     return res.status(500).json({ error: err.message });
   } finally {
     client.release();
-  }
-});
-
-// Orçamentos mensais por categoria
-router.get('/api/budgets', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {
-  try {
-    const result = await pool.query(
-      `SELECT b.id, b.category_id, b.year, b.month, b.amount,
-         c.name AS category_name, c.color AS category_color,
-         COALESCE(SUM(t.amount), 0) AS spent
-       FROM family_budgets b
-       JOIN categories c ON c.id::text = b.category_id AND c.family_id::text = b.family_id
-       LEFT JOIN transactions t
-         ON t.family_id::text = b.family_id
-         AND t.category_id::text = b.category_id
-         AND t.type = 'EXPENSE'
-         AND EXTRACT(YEAR FROM COALESCE(t.due_date, t.transaction_date)) = b.year
-         AND EXTRACT(MONTH FROM COALESCE(t.due_date, t.transaction_date)) = b.month
-       WHERE b.family_id = $1
-       GROUP BY b.id, c.name, c.color
-       ORDER BY b.year DESC, b.month DESC, c.name ASC`,
-      [req.familyAccess!.familyId]
-    );
-    return res.json(result.rows);
-  } catch (err: any) {
-    console.error('Erro ao carregar orçamentos familiares:', err);
-    return res.status(500).json({ error: 'Não foi possível carregar os orçamentos da família.' });
-  }
-});
-
-router.put('/api/budgets', requireFamilyPermission('categories_manage'), async (req: Request, res: Response): Promise<any> => {
-  const { category_id, year, month, amount } = req.body;
-  const budgetYear = Number(year);
-  const budgetMonth = Number(month);
-  const budgetAmount = Number(amount);
-  if (!category_id || !Number.isInteger(budgetYear) || budgetYear < 2000 || budgetYear > 2200 ||
-      !Number.isInteger(budgetMonth) || budgetMonth < 1 || budgetMonth > 12 ||
-      !Number.isFinite(budgetAmount) || budgetAmount <= 0) {
-    return res.status(400).json({ error: 'Categoria, mês, ano e um limite maior que zero são obrigatórios.' });
-  }
-
-  try {
-    const categoryResult = await pool.query(
-      `SELECT id FROM categories
-       WHERE id::text = $1 AND family_id::text = $2 AND flow_type = 'EXPENSE'`,
-      [String(category_id), req.familyAccess!.familyId]
-    );
-    if (categoryResult.rows.length === 0) {
-      return res.status(400).json({ error: 'Selecione uma categoria de despesa desta família.' });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO family_budgets (family_id, category_id, year, month, amount)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (family_id, category_id, year, month)
-       DO UPDATE SET amount = EXCLUDED.amount, updated_at = NOW()
-       RETURNING id, category_id, year, month, amount`,
-      [req.familyAccess!.familyId, String(category_id), budgetYear, budgetMonth, budgetAmount]
-    );
-    return res.json(result.rows[0]);
-  } catch (err: any) {
-    console.error('Erro ao salvar orçamento familiar:', err);
-    return res.status(500).json({ error: 'Não foi possível salvar o orçamento.' });
-  }
-});
-
-router.delete('/api/budgets/:id', requireFamilyPermission('categories_manage'), async (req: Request, res: Response): Promise<any> => {
-  try {
-    const result = await pool.query(
-      'DELETE FROM family_budgets WHERE id = $1 AND family_id = $2 RETURNING id',
-      [req.params.id, req.familyAccess!.familyId]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Orçamento não encontrado nesta família.' });
-    }
-    return res.json({ message: 'Orçamento removido.' });
-  } catch (err: any) {
-    console.error('Erro ao remover orçamento familiar:', err);
-    return res.status(500).json({ error: 'Não foi possível remover o orçamento.' });
   }
 });
 

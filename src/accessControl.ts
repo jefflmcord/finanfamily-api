@@ -72,21 +72,30 @@ export async function initializeAccessControl(): Promise<void> {
       ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'BOLETO'
   `);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS family_budgets (
-      id BIGSERIAL PRIMARY KEY,
-      family_id TEXT NOT NULL,
-      category_id TEXT NOT NULL,
-      year INTEGER NOT NULL,
-      month INTEGER NOT NULL CHECK (month BETWEEN 1 AND 12),
-      amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (family_id, category_id, year, month)
-    )
+    ALTER TABLE categories
+      ADD COLUMN IF NOT EXISTS budget_amount NUMERIC(12, 2)
+      CHECK (budget_amount IS NULL OR budget_amount > 0)
   `);
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS family_budgets_period_idx
-      ON family_budgets (family_id, year, month)
+    DO $$
+    BEGIN
+      IF to_regclass('family_budgets') IS NOT NULL THEN
+        EXECUTE $migration$
+          UPDATE categories c
+          SET budget_amount = latest.amount
+          FROM (
+            SELECT DISTINCT ON (family_id, category_id) family_id, category_id, amount
+            FROM family_budgets
+            ORDER BY family_id, category_id, updated_at DESC, year DESC, month DESC
+          ) latest
+          WHERE c.id::text = latest.category_id
+            AND c.family_id::text = latest.family_id
+            AND c.flow_type = 'EXPENSE'
+            AND c.budget_amount IS NULL
+        $migration$;
+        EXECUTE 'DROP TABLE family_budgets';
+      END IF;
+    END $$
   `);
   await pool.query(`
     UPDATE transactions
