@@ -28,12 +28,16 @@ const authenticateToken = (req: any, res: Response, next: NextFunction): any => 
 };
 
 // Função auxiliar para garantir que a categoria "Investimento" existe para a família
-async function ensureInvestmentCategory(client: any, familyId: number) {
+async function ensureInvestmentCategory(client: any, familyId: string | number) {
   let catRes = await client.query(
-    `SELECT id FROM categories WHERE family_id = $1 AND LOWER(name) = 'investimento'`,
+    `SELECT id FROM categories WHERE family_id = $1 AND LOWER(name) = 'investimento' FOR UPDATE`,
     [familyId]
   );
   if (catRes.rows.length > 0) {
+    await client.query(
+      "UPDATE categories SET flow_type = 'EXPENSE' WHERE id = $1",
+      [catRes.rows[0].id]
+    );
     return catRes.rows[0].id;
   }
   const newCat = await client.query(
@@ -165,11 +169,148 @@ router.get('/api/categories', async (req: Request, res: Response): Promise<any> 
   const { family_id } = req.query;
   if (!family_id) return res.status(400).json({ error: 'family_id é obrigatório.' });
 
+  const client = await pool.connect();
   try {
-    const result = await pool.query(`SELECT * FROM categories WHERE family_id = $1 ORDER BY name ASC`, [String(family_id)]);
+    await client.query('BEGIN');
+    await ensureInvestmentCategory(client, String(family_id));
+    const result = await client.query(
+      `SELECT c.*, COUNT(t.id)::int AS transaction_count
+       FROM categories c
+       LEFT JOIN transactions t ON t.category_id = c.id
+       WHERE c.family_id = $1
+       GROUP BY c.id
+       ORDER BY c.name ASC`,
+      [String(family_id)]
+    );
+    await client.query('COMMIT');
     return res.json(result.rows);
   } catch (err: any) {
+    await client.query('ROLLBACK');
     return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/api/categories', async (req: Request, res: Response): Promise<any> => {
+  const { family_id, name, type = 'VARIABLE', flow_type = 'EXPENSE', color = '#10b981' } = req.body;
+  const normalizedName = typeof name === 'string' ? name.trim() : '';
+  if (!family_id || !normalizedName) {
+    return res.status(400).json({ error: 'family_id e name são obrigatórios.' });
+  }
+  if (!['EXPENSE', 'INCOME'].includes(flow_type) || !['FIXED', 'VARIABLE'].includes(type)) {
+    return res.status(400).json({ error: 'Tipo e fluxo da categoria são inválidos.' });
+  }
+  if (normalizedName.toLocaleLowerCase('pt-BR') === 'investimento') {
+    return res.status(409).json({ error: 'A categoria Investimento já é pré-cadastrada e reservada.' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO categories (family_id, name, type, flow_type, color)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [family_id, normalizedName, type, flow_type, color]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/api/categories/:id', async (req: Request, res: Response): Promise<any> => {
+  const { id } = req.params;
+  const { name, type, flow_type, color } = req.body;
+  const normalizedName = typeof name === 'string' ? name.trim() : '';
+  if (!normalizedName || !['FIXED', 'VARIABLE'].includes(type) ||
+      !['EXPENSE', 'INCOME'].includes(flow_type) || typeof color !== 'string') {
+    return res.status(400).json({ error: 'Nome, natureza, fluxo e cor da categoria são obrigatórios.' });
+  }
+  if (normalizedName.toLocaleLowerCase('pt-BR') === 'investimento') {
+    return res.status(409).json({ error: 'A categoria Investimento é reservada e não pode ser renomeada.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const categoryResult = await client.query(
+      'SELECT id, name, flow_type FROM categories WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    const category = categoryResult.rows[0];
+    if (!category) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Categoria não encontrada.' });
+    }
+    if (String(category.name).toLocaleLowerCase('pt-BR') === 'investimento') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'A categoria Investimento é reservada e não pode ser editada.' });
+    }
+
+    const linkedResult = await client.query(
+      'SELECT EXISTS (SELECT 1 FROM transactions WHERE category_id = $1) AS has_transactions',
+      [id]
+    );
+    if (linkedResult.rows[0].has_transactions && flow_type !== category.flow_type) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'O fluxo não pode ser alterado enquanto houver lançamentos vinculados à categoria.'
+      });
+    }
+
+    const result = await client.query(
+      `UPDATE categories SET name = $1, type = $2, flow_type = $3, color = $4
+       WHERE id = $5 RETURNING *`,
+      [normalizedName, type, flow_type, color, id]
+    );
+    await client.query('COMMIT');
+    return res.json(result.rows[0]);
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+router.delete('/api/categories/:id', async (req: Request, res: Response): Promise<any> => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const categoryResult = await client.query(
+      'SELECT id, name FROM categories WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    const category = categoryResult.rows[0];
+    if (!category) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Categoria não encontrada.' });
+    }
+    if (String(category.name).toLocaleLowerCase('pt-BR') === 'investimento') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'A categoria Investimento é reservada e não pode ser excluída.' });
+    }
+
+    const linkedResult = await client.query(
+      'SELECT COUNT(*)::int AS transaction_count FROM transactions WHERE category_id = $1',
+      [id]
+    );
+    const transactionCount = linkedResult.rows[0].transaction_count;
+    if (transactionCount > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: `Esta categoria possui ${transactionCount} lançamento(s) vinculado(s) e não pode ser excluída.`
+      });
+    }
+
+    await client.query('DELETE FROM categories WHERE id = $1', [id]);
+    await client.query('COMMIT');
+    return res.json({ message: 'Categoria excluída com sucesso.' });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -362,6 +503,17 @@ router.post('/api/transactions', async (req: Request, res: Response): Promise<an
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    if (category_id) {
+      const categoryResult = await client.query(
+        'SELECT id FROM categories WHERE id = $1 AND family_id = $2 AND flow_type = $3 FOR SHARE',
+        [category_id, family_id, type]
+      );
+      if (categoryResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'A categoria selecionada não pertence a esta família ou ao tipo do lançamento.' });
+      }
+    }
+
     if (payment_method === 'CARD' && credit_card_id) {
       const cardResult = await client.query(
         'SELECT id FROM credit_cards WHERE id = $1 AND family_id = $2 FOR UPDATE',
@@ -505,9 +657,31 @@ router.post('/api/goals', async (req: Request, res: Response): Promise<any> => {
 router.put('/api/transactions/:id', async (req: Request, res: Response): Promise<any> => {
   const { id } = req.params;
   const { description, amount, due_date, status, category_id, account_id, payment_method } = req.body;
-  
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+    const transactionResult = await client.query(
+      'SELECT family_id, type FROM transactions WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    const transaction = transactionResult.rows[0];
+    if (!transaction) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Transação não encontrada.' });
+    }
+
+    if (category_id) {
+      const categoryResult = await client.query(
+        'SELECT id FROM categories WHERE id = $1 AND family_id = $2 AND flow_type = $3 FOR SHARE',
+        [category_id, transaction.family_id, transaction.type]
+      );
+      if (categoryResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'A categoria selecionada não pertence a esta família ou ao tipo do lançamento.' });
+      }
+    }
+
+    const result = await client.query(
       `UPDATE transactions 
        SET description = $1, amount = $2, due_date = $3, status = $4, category_id = $5, account_id = $6, payment_method = $7 
        WHERE id = $8 RETURNING *`,
@@ -522,10 +696,13 @@ router.put('/api/transactions/:id', async (req: Request, res: Response): Promise
         id
       ]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Transação não encontrada.' });
+    await client.query('COMMIT');
     return res.json({ message: 'Transação atualizada.', transaction: result.rows[0] });
   } catch (err: any) {
+    await client.query('ROLLBACK');
     return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
