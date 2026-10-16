@@ -606,16 +606,23 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
       }
     }
 
-    const totalInst = Math.max(1, Number(total_installments));
+    const totalInst = Number(total_installments);
+    const startInst = Number(start_installment);
+    if (!Number.isInteger(totalInst) || totalInst < 1 || !Number.isInteger(startInst) || startInst < 1 || startInst > totalInst) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'O total de parcelas e a parcela inicial devem formar um intervalo válido.' });
+    }
     const instAmount = Math.round((Number(amount) / totalInst) * 100) / 100;
 
     let parentId: string | null = null;
     const createdTransactions = [];
 
-    for (let i = Number(start_installment); i <= totalInst; i++) {
+    for (let i = startInst; i <= totalInst; i++) {
       const [year, month, day] = due_date.split('-');
-      const targetDate = new Date(Number(year), Number(month) - 1 + (i - 1), Number(day));
-      const formattedDueDate = targetDate.toISOString().split('T')[0];
+      const targetMonth = new Date(Date.UTC(Number(year), Number(month) - 1 + (i - startInst), 1));
+      const lastDayOfMonth = new Date(Date.UTC(targetMonth.getUTCFullYear(), targetMonth.getUTCMonth() + 1, 0)).getUTCDate();
+      targetMonth.setUTCDate(Math.min(Number(day), lastDayOfMonth));
+      const formattedDueDate = targetMonth.toISOString().split('T')[0];
 
       const installmentDescription = totalInst > 1 ? `${description} (${i}/${totalInst})` : description;
 
@@ -642,7 +649,7 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
         ]
       );
 
-      if (i === Number(start_installment)) {
+      if (i === startInst) {
         parentId = result.rows[0].id;
       }
       createdTransactions.push(result.rows[0]);
