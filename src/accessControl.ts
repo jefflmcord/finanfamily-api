@@ -65,6 +65,7 @@ export async function initializeAccessControl(): Promise<void> {
       accepted_at TIMESTAMPTZ
     )
   `);
+  await pool.query('ALTER TABLE transactions ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12, 2)');
   await pool.query(`
     CREATE INDEX IF NOT EXISTS family_invitations_family_email_idx
       ON family_invitations (family_id, email)

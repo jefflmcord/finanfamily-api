@@ -749,7 +749,7 @@ router.put('/api/transactions/:id', requireFamilyPermission('transactions_edit')
   try {
     await client.query('BEGIN');
     const transactionResult = await client.query(
-      'SELECT family_id, type, status, amount, account_id FROM transactions WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      'SELECT family_id, type, status, amount, paid_amount, account_id FROM transactions WHERE id = $1 AND family_id = $2 FOR UPDATE',
       [id, req.familyAccess!.familyId]
     );
     const transaction = transactionResult.rows[0];
@@ -785,6 +785,10 @@ router.put('/api/transactions/:id', requireFamilyPermission('transactions_edit')
     const nextAccountId = payment_method === 'CARD' && transaction.status !== 'PAID'
       ? null
       : account_id || transaction.account_id || null;
+    const previousPaidAmount = Number(transaction.paid_amount ?? transaction.amount);
+    const nextPaidAmount = transaction.status === 'PAID'
+      ? Math.max(parsedAmount, previousPaidAmount + parsedAmount - Number(transaction.amount))
+      : null;
     if (nextAccountId) {
       const accountResult = await client.query(
         'SELECT id FROM accounts WHERE id = $1 AND family_id = $2 FOR UPDATE',
@@ -797,7 +801,7 @@ router.put('/api/transactions/:id', requireFamilyPermission('transactions_edit')
     }
 
     if (transaction.status === 'PAID' &&
-        (Number(transaction.amount) !== parsedAmount || String(transaction.account_id) !== String(nextAccountId))) {
+        (previousPaidAmount !== nextPaidAmount || String(transaction.account_id) !== String(nextAccountId))) {
       if (!transaction.account_id || !nextAccountId) {
         await client.query('ROLLBACK');
         return res.status(409).json({ error: 'Não é possível ajustar o saldo de um lançamento pago sem uma conta vinculada.' });
@@ -814,24 +818,24 @@ router.put('/api/transactions/:id', requireFamilyPermission('transactions_edit')
       if (String(transaction.account_id) === String(nextAccountId)) {
         await client.query(
           'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
-          [balanceSign * (parsedAmount - Number(transaction.amount)), nextAccountId, req.familyAccess!.familyId]
+          [balanceSign * (Number(nextPaidAmount) - previousPaidAmount), nextAccountId, req.familyAccess!.familyId]
         );
       } else {
         await client.query(
           'UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND family_id = $3',
-          [balanceSign * Number(transaction.amount), transaction.account_id, req.familyAccess!.familyId]
+          [balanceSign * previousPaidAmount, transaction.account_id, req.familyAccess!.familyId]
         );
         await client.query(
           'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
-          [balanceSign * parsedAmount, nextAccountId, req.familyAccess!.familyId]
+          [balanceSign * Number(nextPaidAmount), nextAccountId, req.familyAccess!.familyId]
         );
       }
     }
 
     const result = await client.query(
       `UPDATE transactions
-       SET description = $1, amount = $2, due_date = $3, category_id = $4, account_id = $5, payment_method = $6
-       WHERE id = $7 AND family_id = $8 RETURNING *`,
+       SET description = $1, amount = $2, due_date = $3, category_id = $4, account_id = $5, payment_method = $6, paid_amount = $7
+       WHERE id = $8 AND family_id = $9 RETURNING *`,
       [
         description.trim(),
         parsedAmount,
@@ -839,6 +843,7 @@ router.put('/api/transactions/:id', requireFamilyPermission('transactions_edit')
         category_id || null,
         nextAccountId,
         payment_method || 'BOLETO',
+        nextPaidAmount,
         id,
         req.familyAccess!.familyId
       ]
@@ -879,9 +884,11 @@ router.patch('/api/transactions/:id/pay', requireFamilyPermission('transactions_
     }
 
     const finalAmount = Number(paid_amount ?? transaction.amount);
-    if (!Number.isFinite(finalAmount) || finalAmount !== Number(transaction.amount)) {
+    const validPaidAmount = Number.isFinite(finalAmount) && finalAmount > 0 &&
+      (transaction.type === 'EXPENSE' ? finalAmount >= Number(transaction.amount) : finalAmount === Number(transaction.amount));
+    if (!validPaidAmount) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'O valor pago deve corresponder ao valor total do lançamento.' });
+      return res.status(400).json({ error: 'O valor pago deve ser válido e não pode ser inferior ao valor do lançamento.' });
     }
 
     let accountId = account_id || transaction.account_id;
@@ -914,8 +921,8 @@ router.patch('/api/transactions/:id/pay', requireFamilyPermission('transactions_
     );
 
     const updatedTransaction = await client.query(
-      "UPDATE transactions SET status = 'PAID', account_id = $2 WHERE id = $1 AND family_id = $3 RETURNING *",
-      [id, accountId, req.familyAccess!.familyId]
+      "UPDATE transactions SET status = 'PAID', account_id = $2, paid_amount = $3 WHERE id = $1 AND family_id = $4 RETURNING *",
+      [id, accountId, finalAmount, req.familyAccess!.familyId]
     );
 
     await client.query('COMMIT');
@@ -934,7 +941,7 @@ router.patch('/api/transactions/:id/unpay', requireFamilyPermission('transaction
   try {
     await client.query('BEGIN');
     const transactionResult = await client.query(
-      'SELECT id, family_id, amount, type, status, account_id FROM transactions WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      'SELECT id, family_id, amount, paid_amount, type, status, account_id FROM transactions WHERE id = $1 AND family_id = $2 FOR UPDATE',
       [id, req.familyAccess!.familyId]
     );
     const transaction = transactionResult.rows[0];
@@ -960,15 +967,14 @@ router.patch('/api/transactions/:id/unpay', requireFamilyPermission('transaction
       return res.status(409).json({ error: 'A conta vinculada ao lançamento não pertence mais a esta família.' });
     }
 
-    const balanceChange = transaction.type === 'INCOME'
-      ? -Number(transaction.amount)
-      : Number(transaction.amount);
+    const settledAmount = Number(transaction.paid_amount ?? transaction.amount);
+    const balanceChange = transaction.type === 'INCOME' ? -settledAmount : settledAmount;
     await client.query(
       'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
       [balanceChange, transaction.account_id, req.familyAccess!.familyId]
     );
     const updatedTransaction = await client.query(
-      "UPDATE transactions SET status = 'PENDING' WHERE id = $1 AND family_id = $2 RETURNING *",
+      "UPDATE transactions SET status = 'PENDING', paid_amount = NULL WHERE id = $1 AND family_id = $2 RETURNING *",
       [id, req.familyAccess!.familyId]
     );
     await client.query('COMMIT');
@@ -999,7 +1005,7 @@ router.delete('/api/transactions/:id', requireFamilyPermission('transactions_del
     );
 
     const paidTransactionBalances = await client.query(
-      `SELECT account_id, family_id, type, SUM(amount) AS amount_to_restore
+      `SELECT account_id, family_id, type, SUM(COALESCE(paid_amount, amount)) AS amount_to_restore
        FROM transactions
        WHERE (${transactionFilter}) AND family_id = $${transactionParams.length + 1}
          AND type IN ('EXPENSE', 'INCOME') AND status = 'PAID' AND account_id IS NOT NULL
