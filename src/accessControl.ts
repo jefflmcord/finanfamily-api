@@ -77,6 +77,12 @@ export async function initializeAccessControl(): Promise<void> {
       CHECK (budget_amount IS NULL OR budget_amount > 0)
   `);
   await pool.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS phone TEXT,
+      ADD COLUMN IF NOT EXISTS birth_date DATE,
+      ADD COLUMN IF NOT EXISTS bio VARCHAR(280)
+  `);
+  await pool.query(`
     DO $$
     BEGIN
       IF to_regclass('family_budgets') IS NOT NULL THEN

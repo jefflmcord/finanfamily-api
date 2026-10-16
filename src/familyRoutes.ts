@@ -149,6 +149,90 @@ router.get('/api/family/access', async (req: Request, res: Response): Promise<an
   });
 });
 
+router.get('/api/family/profile', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, email, avatar_url, phone, birth_date, bio
+       FROM users WHERE id::text = $1`,
+      [req.familyAccess!.userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Perfil do usuário não encontrado.' });
+    }
+    return res.json(result.rows[0]);
+  } catch (error: any) {
+    console.error('Erro ao carregar perfil do usuário:', error);
+    return res.status(500).json({ error: 'Não foi possível carregar seu perfil.' });
+  }
+});
+
+router.put('/api/family/profile', async (req: Request, res: Response): Promise<any> => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const optionalFields = ['phone', 'avatar_url', 'birth_date', 'bio'];
+  if (optionalFields.some(field => body[field] !== undefined && typeof body[field] !== 'string')) {
+    return res.status(400).json({ error: 'Os campos do perfil devem ser enviados como texto.' });
+  }
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const phone = typeof body.phone === 'string' ? body.phone.trim() : '';
+  const avatarUrl = typeof body.avatar_url === 'string' ? body.avatar_url.trim() : '';
+  const birthDate = typeof body.birth_date === 'string' ? body.birth_date.trim() : '';
+  const bio = typeof body.bio === 'string' ? body.bio.trim() : '';
+
+  if (!name || name.length > 100) {
+    return res.status(400).json({ error: 'O nome de exibição é obrigatório e deve ter até 100 caracteres.' });
+  }
+  if (phone.length > 30) {
+    return res.status(400).json({ error: 'O telefone deve ter até 30 caracteres.' });
+  }
+  if (avatarUrl.length > 2048) {
+    return res.status(400).json({ error: 'O endereço da foto deve ter até 2048 caracteres.' });
+  }
+  if (avatarUrl) {
+    try {
+      const parsedAvatarUrl = new URL(avatarUrl);
+      if (parsedAvatarUrl.protocol !== 'https:') throw new Error('Unsupported protocol');
+    } catch {
+      return res.status(400).json({ error: 'Informe um endereço HTTPS válido para a foto de perfil.' });
+    }
+  }
+  if (birthDate) {
+    const parsedBirthDate = new Date(`${birthDate}T00:00:00.000Z`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(birthDate) ||
+        Number.isNaN(parsedBirthDate.getTime()) ||
+        parsedBirthDate.toISOString().slice(0, 10) !== birthDate ||
+        parsedBirthDate.getTime() > Date.now()) {
+      return res.status(400).json({ error: 'Informe uma data de nascimento válida, que não seja futura.' });
+    }
+  }
+  if (bio.length > 280) {
+    return res.status(400).json({ error: 'A descrição pessoal deve ter até 280 caracteres.' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE users
+       SET name = $1, phone = $2, avatar_url = $3, birth_date = $4, bio = $5
+       WHERE id::text = $6
+       RETURNING id, name, email, avatar_url, phone, birth_date, bio`,
+      [
+        name,
+        phone || null,
+        avatarUrl || null,
+        birthDate || null,
+        bio || null,
+        req.familyAccess!.userId,
+      ]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Perfil do usuário não encontrado.' });
+    }
+    return res.json(result.rows[0]);
+  } catch (error: any) {
+    console.error('Erro ao atualizar perfil do usuário:', error);
+    return res.status(500).json({ error: 'Não foi possível salvar as alterações do perfil.' });
+  }
+});
+
 router.get('/api/family/members', requireFamilyPermission('members_manage'), async (req: Request, res: Response): Promise<any> => {
   try {
     const result = await pool.query(
