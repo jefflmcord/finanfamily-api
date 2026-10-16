@@ -16,6 +16,14 @@ const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
+function addMonthsToDate(dateValue: string, monthOffset: number): string {
+  const [year, month, day] = dateValue.slice(0, 10).split('-').map(Number);
+  const targetMonth = new Date(Date.UTC(year, month - 1 + monthOffset, 1));
+  const lastDayOfMonth = new Date(Date.UTC(targetMonth.getUTCFullYear(), targetMonth.getUTCMonth() + 1, 0)).getUTCDate();
+  targetMonth.setUTCDate(Math.min(day, lastDayOfMonth));
+  return targetMonth.toISOString().split('T')[0];
+}
+
 // Rota raiz para teste de status
 router.get('/', (req: Request, res: Response) => {
   return res.status(200).json({ status: 'online', message: 'API FinanFamily a funcionar perfeitamente!' });
@@ -686,11 +694,14 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
     status = 'PENDING',
     total_installments = 1,
     start_installment = 1,
+    recurrence_months = 1,
     payment_method = 'BOLETO'
   } = req.body;
   const family_id = req.familyAccess!.familyId;
 
-  if (!family_id || !description || !amount || !transaction_date || !due_date || !type) {
+  const transactionAmount = Number(amount);
+  if (!family_id || !description || !Number.isFinite(transactionAmount) || transactionAmount <= 0 ||
+      !transaction_date || !due_date || !type) {
     return res.status(400).json({ error: 'family_id, description, amount, transaction_date, due_date e type são obrigatórios.' });
   }
   if (status !== 'PENDING') {
@@ -724,23 +735,32 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
 
     const totalInst = Number(total_installments);
     const startInst = Number(start_installment);
+    const recurrenceMonths = Number(recurrence_months);
     if (!Number.isInteger(totalInst) || totalInst < 1 || !Number.isInteger(startInst) || startInst < 1 || startInst > totalInst) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'O total de parcelas e a parcela inicial devem formar um intervalo válido.' });
     }
-    const instAmount = Math.round((Number(amount) / totalInst) * 100) / 100;
+    if (!Number.isInteger(recurrenceMonths) || recurrenceMonths < 1 || recurrenceMonths > 120 ||
+        (recurrenceMonths > 1 && (type !== 'EXPENSE' || totalInst !== 1 || startInst !== 1))) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'A recorrência deve ter entre 1 e 120 meses e só pode ser usada em contas a pagar sem parcelamento.' });
+    }
+    const isRecurring = recurrenceMonths > 1;
+    const installmentAmount = Math.round((transactionAmount / totalInst) * 100) / 100;
+    const creationCount = isRecurring ? recurrenceMonths : totalInst - startInst + 1;
 
     let parentId: string | null = null;
     const createdTransactions = [];
 
-    for (let i = startInst; i <= totalInst; i++) {
-      const [year, month, day] = due_date.split('-');
-      const targetMonth = new Date(Date.UTC(Number(year), Number(month) - 1 + (i - startInst), 1));
-      const lastDayOfMonth = new Date(Date.UTC(targetMonth.getUTCFullYear(), targetMonth.getUTCMonth() + 1, 0)).getUTCDate();
-      targetMonth.setUTCDate(Math.min(Number(day), lastDayOfMonth));
-      const formattedDueDate = targetMonth.toISOString().split('T')[0];
-
-      const installmentDescription = totalInst > 1 ? `${description} (${i}/${totalInst})` : description;
+    for (let occurrence = 0; occurrence < creationCount; occurrence++) {
+      const installmentNumber = isRecurring ? 1 : startInst + occurrence;
+      const formattedDueDate = addMonthsToDate(due_date, occurrence);
+      const formattedTransactionDate = isRecurring
+        ? addMonthsToDate(transaction_date, occurrence)
+        : transaction_date;
+      const transactionDescription = !isRecurring && totalInst > 1
+        ? `${description} (${installmentNumber}/${totalInst})`
+        : description;
 
       const result = await client.query(
         `INSERT INTO transactions (
@@ -753,26 +773,31 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
           payment_method === 'CARD' ? null : (account_id || null),
           payment_method === 'CARD' ? (credit_card_id || null) : null,
           category_id || null,
-          installmentDescription,
-          instAmount,
+          transactionDescription,
+          isRecurring ? transactionAmount : installmentAmount,
           type,
           status,
-          transaction_date,
+          formattedTransactionDate,
           formattedDueDate,
-          i,
-          totalInst,
-          parentId
+          isRecurring ? 1 : installmentNumber,
+          isRecurring ? 1 : totalInst,
+          isRecurring ? null : parentId
         ]
       );
 
-      if (i === startInst) {
+      if (!isRecurring && occurrence === 0) {
         parentId = result.rows[0].id;
       }
       createdTransactions.push(result.rows[0]);
     }
 
     await client.query('COMMIT');
-    return res.status(201).json({ message: 'Lançamento(s) criado(s) com sucesso!', transactions: createdTransactions });
+    return res.status(201).json({
+      message: isRecurring
+        ? `${createdTransactions.length} contas a pagar mensais criadas com sucesso!`
+        : 'Lançamento(s) criado(s) com sucesso!',
+      transactions: createdTransactions
+    });
   } catch (err: any) {
     await client.query('ROLLBACK');
     return res.status(500).json({ error: err.message });
