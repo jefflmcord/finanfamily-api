@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import { OAuth2Client } from 'google-auth-library';
 import { pool } from './database';
 import familyRouter, { publicFamilyRouter } from './familyRoutes';
+import annualProvisionsRouter from './annualProvisions';
 import {
   authenticateFamilyMember,
   FAMILY_PERMISSIONS,
@@ -266,6 +267,7 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
 router.use(publicFamilyRouter);
 router.use('/api', authenticateFamilyMember);
 router.use(familyRouter);
+router.use('/api/annual-provisions', annualProvisionsRouter);
 
 // 3. CONTAS BANCÁRIAS
 router.get('/api/accounts', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {

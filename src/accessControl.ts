@@ -34,6 +34,7 @@ export const FAMILY_PERMISSIONS = [
   'cards_manage',
   'categories_manage',
   'goals_manage',
+  'provisions_manage',
   'members_manage',
 ] as const;
 
@@ -116,6 +117,47 @@ export async function initializeAccessControl(): Promise<void> {
       value TEXT NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS annual_provisions (
+      id BIGSERIAL PRIMARY KEY,
+      family_id TEXT NOT NULL,
+      title VARCHAR(120) NOT NULL,
+      expense_type TEXT NOT NULL CHECK (expense_type IN ('IPTU', 'IPVA', 'LICENCIAMENTO', 'OTHER')),
+      target_amount NUMERIC(12, 2) NOT NULL CHECK (target_amount > 0),
+      saved_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (saved_amount >= 0),
+      due_date DATE NOT NULL,
+      status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'PAID')),
+      actual_amount NUMERIC(12, 2) CHECK (actual_amount IS NULL OR actual_amount > 0),
+      paid_date DATE,
+      renewed_from_id BIGINT UNIQUE REFERENCES annual_provisions(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS annual_provision_contributions (
+      id BIGSERIAL PRIMARY KEY,
+      provision_id BIGINT NOT NULL REFERENCES annual_provisions(id) ON DELETE CASCADE,
+      family_id TEXT NOT NULL,
+      amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+      contribution_date DATE NOT NULL,
+      created_by TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS annual_provisions_family_due_idx
+      ON annual_provisions (family_id, status, due_date)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS annual_provision_contributions_provision_date_idx
+      ON annual_provision_contributions (provision_id, contribution_date DESC)
+  `);
+  await pool.query(`
+    UPDATE family_members
+    SET permissions = jsonb_set(COALESCE(permissions, '{}'::jsonb), '{provisions_manage}', 'false'::jsonb, true)
+    WHERE NOT COALESCE(permissions ? 'provisions_manage', false)
   `);
   await pool.query(
     `INSERT INTO system_settings (key, value)
