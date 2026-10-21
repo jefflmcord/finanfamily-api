@@ -3,7 +3,7 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { OAuth2Client } from 'google-auth-library';
 import { pool } from './database';
-import familyRouter, { publicFamilyRouter } from './familyRoutes';
+import familyRouter, { publicFamilyRouter, seedDefaultFamilyResources } from './familyRoutes';
 import annualProvisionsRouter from './annualProvisions';
 import {
   authenticateFamilyMember,
@@ -212,18 +212,13 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
       );
     } else {
       const familyRes = await client.query(
-        'INSERT INTO families (name) VALUES ($1) RETURNING id',
+        `INSERT INTO families (name, registered_at, plan_type, trial_ends_at)
+         VALUES ($1, NOW(), 'TRIAL', NOW() + INTERVAL '10 days')
+         RETURNING id`,
         [`Família de ${name || 'Utilizador'}`]
       );
       const familyId = familyRes.rows[0].id;
-      await client.query(
-        'INSERT INTO accounts (family_id, name, balance) VALUES ($1, $2, $3)',
-        [familyId, 'Conta Principal', 0]
-      );
-      await client.query(
-        'INSERT INTO categories (family_id, name, flow_type) VALUES ($1, $2, $3)',
-        [familyId, 'Investimento', 'EXPENSE']
-      );
+      await seedDefaultFamilyResources(client, familyId);
       const userRes = await client.query(
         `INSERT INTO users (name, email, google_id, avatar_url, family_id, email_verified)
          VALUES ($1, $2, $3, $4, $5, TRUE)
@@ -236,6 +231,20 @@ router.post('/api/auth/google', async (req: Request, res: Response): Promise<any
         `INSERT INTO family_members (family_id, user_id, role, permissions)
          VALUES ($1, $2, 'OWNER', $3::jsonb)`,
         [String(familyId), String(user.id), JSON.stringify(ownerPermissions)]
+      );
+    }
+
+    const leadMatch = await client.query(
+      `UPDATE marketing_leads
+       SET status = 'CONVERTED', updated_at = NOW()
+       WHERE LOWER(email) = $1
+       RETURNING whatsapp`,
+      [cleanEmail]
+    );
+    if (leadMatch.rows[0]?.whatsapp) {
+      await client.query(
+        `UPDATE users SET phone = COALESCE(NULLIF(phone, ''), $1) WHERE id = $2`,
+        [leadMatch.rows[0].whatsapp, user.id]
       );
     }
 

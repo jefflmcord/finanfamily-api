@@ -18,6 +18,30 @@ const VALID_PLAN_TYPES = ['TRIAL', 'MONTHLY', 'ANNUAL', 'COURTESY'] as const;
 const VALID_BROADCAST_TYPES = ['INFO', 'SUCCESS', 'WARNING'] as const;
 const VALID_LEAD_STATUSES = ['NEW', 'CONTACTED', 'CONVERTED', 'ARCHIVED'] as const;
 
+const DEFAULT_FAMILY_CATEGORIES: Array<{ name: string; flow_type: 'EXPENSE' | 'INCOME' }> = [
+  { name: 'Investimento', flow_type: 'EXPENSE' },
+  { name: 'Moradia & Contas', flow_type: 'EXPENSE' },
+  { name: 'Supermercado & Alimentação', flow_type: 'EXPENSE' },
+  { name: 'Transporte & Combustível', flow_type: 'EXPENSE' },
+  { name: 'Saúde & Farmácia', flow_type: 'EXPENSE' },
+  { name: 'Lazer & Assinaturas', flow_type: 'EXPENSE' },
+  { name: 'Salário & Pró-labore', flow_type: 'INCOME' },
+  { name: 'Renda Extra', flow_type: 'INCOME' },
+];
+
+export async function seedDefaultFamilyResources(client: any, familyId: string | number): Promise<void> {
+  await client.query(
+    'INSERT INTO accounts (family_id, name, bank_name, balance, initial_balance) VALUES ($1, $2, $3, $4, $5)',
+    [familyId, 'Conta Principal', 'Conta Principal', 0, 0]
+  );
+  for (const category of DEFAULT_FAMILY_CATEGORIES) {
+    await client.query(
+      'INSERT INTO categories (family_id, name, flow_type) VALUES ($1, $2, $3)',
+      [familyId, category.name, category.flow_type]
+    );
+  }
+}
+
 async function isInternalAdmin(userId: string): Promise<boolean> {
   const result = await pool.query(
     'SELECT 1 FROM users WHERE id::text = $1 AND LOWER(email) = $2',
@@ -25,6 +49,99 @@ async function isInternalAdmin(userId: string): Promise<boolean> {
   );
   return result.rows.length > 0;
 }
+
+publicRouter.post('/api/public/register', async (req: Request, res: Response): Promise<any> => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim().slice(0, 120) : '';
+  const familyNameInput = typeof req.body?.family_name === 'string' ? req.body.family_name.trim().slice(0, 120) : '';
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const whatsapp = typeof req.body?.whatsapp === 'string' ? req.body.whatsapp.trim().slice(0, 40) : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const digitCount = whatsapp.replace(/\D/g, '').length;
+
+  if (name.length < 2) {
+    return res.status(400).json({ error: 'Informe seu nome completo.' });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Informe um endereço de e-mail válido.' });
+  }
+  if (digitCount < 8 || digitCount > 15) {
+    return res.status(400).json({ error: 'Informe um WhatsApp válido com DDD.' });
+  }
+  if (password.length < 6 || password.length > 64) {
+    return res.status(400).json({ error: 'A senha deve ter pelo menos 6 caracteres.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const existingUser = await client.query(
+      'SELECT id FROM users WHERE LOWER(email) = $1 FOR UPDATE',
+      [email]
+    );
+    if (existingUser.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Este e-mail já possui uma conta cadastrada. Use a aba "Já tenho conta" para entrar.',
+      });
+    }
+
+    const familyName = familyNameInput || `Família de ${name.split(' ')[0]}`;
+    const familyRes = await client.query(
+      `INSERT INTO families (name, registered_at, plan_type, trial_ends_at)
+       VALUES ($1, NOW(), 'TRIAL', NOW() + INTERVAL '10 days')
+       RETURNING id`,
+      [familyName]
+    );
+    const familyId = familyRes.rows[0].id;
+
+    await seedDefaultFamilyResources(client, familyId);
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const userRes = await client.query(
+      `INSERT INTO users (name, email, phone, password_hash, family_id, email_verified)
+       VALUES ($1, $2, $3, $4, $5, TRUE)
+       RETURNING id, name, email, phone, family_id, avatar_url`,
+      [name, email, whatsapp, passwordHash, familyId]
+    );
+    const user = userRes.rows[0];
+
+    const ownerPermissions = Object.fromEntries(FAMILY_PERMISSIONS.map(permission => [permission, true]));
+    await client.query(
+      `INSERT INTO family_members (family_id, user_id, role, permissions)
+       VALUES ($1, $2, 'OWNER', $3::jsonb)`,
+      [String(familyId), String(user.id), JSON.stringify(ownerPermissions)]
+    );
+
+    await client.query(
+      `UPDATE marketing_leads
+       SET status = 'CONVERTED',
+           whatsapp = COALESCE(NULLIF($1, ''), whatsapp),
+           updated_at = NOW()
+       WHERE LOWER(email) = $2`,
+      [whatsapp, email]
+    );
+
+    await client.query('COMMIT');
+
+    const token = jwt.sign(
+      { id: user.id, family_id: user.family_id },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.status(201).json({ token, user });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'Este e-mail já possui uma conta cadastrada.' });
+    }
+    console.error('Erro ao criar nova conta familiar:', error);
+    return res.status(500).json({ error: 'Não foi possível concluir o cadastro agora. Tente novamente.' });
+  } finally {
+    client.release();
+  }
+});
 
 publicRouter.post('/api/public/leads/ebook', async (req: Request, res: Response): Promise<any> => {
   const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
@@ -194,10 +311,23 @@ publicRouter.get('/api/family-invitations/preview', async (req: Request, res: Re
 router.get('/api/family/access', async (req: Request, res: Response): Promise<any> => {
   const access = req.familyAccess!;
   try {
-    const settingsResult = await pool.query(
-      `SELECT key, value FROM system_settings WHERE key IN ('global_broadcast_message', 'global_broadcast_type')`
-    );
+    const [settingsResult, familyResult] = await Promise.all([
+      pool.query(
+        `SELECT key, value FROM system_settings WHERE key IN ('global_broadcast_message', 'global_broadcast_type', 'tenant_support_phone')`
+      ),
+      pool.query(
+        `SELECT f.name,
+                f.registered_at,
+                COALESCE(f.plan_type, 'TRIAL') AS plan_type,
+                COALESCE(f.trial_ends_at, f.registered_at + INTERVAL '10 days') AS trial_ends_at,
+                f.subscription_ends_at::text AS subscription_ends_at
+         FROM families f
+         WHERE f.id::text = $1`,
+        [String(access.familyId)]
+      ),
+    ]);
     const settingsMap = Object.fromEntries(settingsResult.rows.map(row => [row.key, row.value]));
+    const familyRow = familyResult.rows[0];
     return res.json({
       familyId: access.familyId,
       role: access.role,
@@ -207,6 +337,14 @@ router.get('/api/family/access', async (req: Request, res: Response): Promise<an
       broadcast: {
         message: settingsMap.global_broadcast_message || '',
         type: settingsMap.global_broadcast_type || 'INFO',
+      },
+      subscription: {
+        familyName: familyRow?.name || 'Família',
+        planType: familyRow?.plan_type || 'TRIAL',
+        registeredAt: familyRow?.registered_at || null,
+        trialEndsAt: familyRow?.trial_ends_at || null,
+        subscriptionEndsAt: familyRow?.subscription_ends_at || null,
+        contactPhone: settingsMap.tenant_support_phone || '(41) 0000-0000',
       },
     });
   } catch {
