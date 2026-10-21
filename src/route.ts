@@ -879,6 +879,144 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
   }
 });
 
+// 6.1 IMPORTAÇÃO EM LOTE DE EXTRATOS / FATURAS (OFX, CSV, PDF, PRINT)
+router.post('/api/transactions/batch', requireFamilyPermission('transactions_create'), async (req: Request, res: Response): Promise<any> => {
+  const family_id = req.familyAccess!.familyId;
+  const canSettle = req.familyAccess!.role === 'OWNER' || req.familyAccess!.permissions?.transactions_settle === true;
+  const targetType = req.body?.target_type === 'CARD' ? 'CARD' : 'ACCOUNT';
+  const accountId = req.body?.account_id ? String(req.body.account_id) : null;
+  const creditCardId = req.body?.credit_card_id ? String(req.body.credit_card_id) : null;
+  const settleImmediately = Boolean(req.body?.settle_immediately) && targetType === 'ACCOUNT' && canSettle;
+  const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+
+  if (rawItems.length === 0 || rawItems.length > 300) {
+    return res.status(400).json({ error: 'Selecione entre 1 e 300 lançamentos para importar por vez.' });
+  }
+  if (targetType === 'ACCOUNT' && !accountId) {
+    return res.status(400).json({ error: 'Selecione a conta bancária de destino para importar.' });
+  }
+  if (targetType === 'CARD' && !creditCardId) {
+    return res.status(400).json({ error: 'Selecione o cartão de crédito de destino para importar.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (targetType === 'ACCOUNT' && accountId) {
+      const accCheck = await client.query(
+        'SELECT id FROM accounts WHERE id = $1 AND family_id = $2 FOR UPDATE',
+        [accountId, family_id]
+      );
+      if (accCheck.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'A conta bancária selecionada não pertence a esta família.' });
+      }
+    }
+
+    if (targetType === 'CARD' && creditCardId) {
+      const cardCheck = await client.query(
+        'SELECT id FROM credit_cards WHERE id = $1 AND family_id = $2 FOR UPDATE',
+        [creditCardId, family_id]
+      );
+      if (cardCheck.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'O cartão selecionado não pertence a esta família.' });
+      }
+    }
+
+    const categoriesRes = await client.query(
+      'SELECT id, flow_type FROM categories WHERE family_id = $1',
+      [family_id]
+    );
+    const validCategories = new Map<string, string>(
+      categoriesRes.rows.map(row => [String(row.id), String(row.flow_type)])
+    );
+
+    const createdTransactions = [];
+    let netBalanceAdjustment = 0;
+
+    for (const rawItem of rawItems) {
+      const description = typeof rawItem?.description === 'string' ? rawItem.description.trim().slice(0, 180) : '';
+      const amount = Math.round(Math.abs(Number(rawItem?.amount)) * 100) / 100;
+      const type = rawItem?.type === 'INCOME' && targetType === 'ACCOUNT' ? 'INCOME' : 'EXPENSE';
+      const txDate = typeof rawItem?.transaction_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(rawItem.transaction_date)
+        ? rawItem.transaction_date
+        : new Date().toISOString().split('T')[0];
+      const dueDate = typeof rawItem?.due_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(rawItem.due_date)
+        ? rawItem.due_date
+        : txDate;
+      const requestedCatId = rawItem?.category_id ? String(rawItem.category_id) : null;
+      const categoryId = requestedCatId && validCategories.get(requestedCatId) === type ? requestedCatId : null;
+
+      if (!description || !Number.isFinite(amount) || amount <= 0) {
+        continue;
+      }
+
+      const status = settleImmediately ? 'PAID' : 'PENDING';
+      const paidAmount = settleImmediately ? amount : null;
+      const paymentMethod = targetType === 'CARD'
+        ? 'CARD'
+        : typeof rawItem?.payment_method === 'string' && rawItem.payment_method
+          ? rawItem.payment_method
+          : 'PIX';
+
+      const insertRes = await client.query(
+        `INSERT INTO transactions (
+           family_id, account_id, credit_card_id, category_id,
+           description, amount, paid_amount, type, status,
+           transaction_date, due_date, installment_number, total_installments, payment_method
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 1, 1, $12)
+         RETURNING *`,
+        [
+          family_id,
+          targetType === 'ACCOUNT' ? accountId : null,
+          targetType === 'CARD' ? creditCardId : null,
+          categoryId,
+          description,
+          amount,
+          paidAmount,
+          type,
+          status,
+          txDate,
+          dueDate,
+          paymentMethod,
+        ]
+      );
+
+      createdTransactions.push(insertRes.rows[0]);
+      if (settleImmediately) {
+        netBalanceAdjustment += type === 'INCOME' ? amount : -amount;
+      }
+    }
+
+    if (createdTransactions.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Nenhum lançamento válido foi encontrado para importar.' });
+    }
+
+    if (settleImmediately && accountId && netBalanceAdjustment !== 0) {
+      await client.query(
+        'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
+        [Math.round(netBalanceAdjustment * 100) / 100, accountId, family_id]
+      );
+    }
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: `${createdTransactions.length} lançamento(s) importado(s) com sucesso!`,
+      imported_count: createdTransactions.length,
+      transactions: createdTransactions,
+    });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('Erro na importação em lote:', err);
+    return res.status(500).json({ error: 'Não foi possível concluir a importação em lote.' });
+  } finally {
+    client.release();
+  }
+});
+
 // 7. METAS / OBJETIVOS
 router.get('/api/goals', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {
   const family_id = req.familyAccess!.familyId;
