@@ -7,6 +7,7 @@ import {
   FAMILY_PERMISSIONS,
   hashInvitationToken,
   INTERNAL_ADMIN_EMAIL,
+  invalidateAuthMembershipCache,
   requireFamilyPermission,
 } from './accessControl';
 
@@ -359,6 +360,134 @@ router.get('/api/family/access', async (req: Request, res: Response): Promise<an
   }
 });
 
+router.get('/api/family/bootstrap', async (req: Request, res: Response): Promise<any> => {
+  const access = req.familyAccess!;
+  const familyIdStr = String(access.familyId);
+  const canRead = access.role === 'OWNER' || access.permissions?.family_read === true;
+
+  try {
+    const [
+      settingsResult,
+      familyResult,
+      profileResult,
+      accountsResult,
+      categoriesResult,
+      creditCardsResult,
+      transactionsResult,
+    ] = await Promise.all([
+      pool.query(
+        `SELECT key, value FROM system_settings WHERE key IN ('global_broadcast_message', 'global_broadcast_type', 'tenant_support_phone')`
+      ),
+      pool.query(
+        `SELECT f.name,
+                f.registered_at,
+                COALESCE(f.plan_type, 'TRIAL') AS plan_type,
+                COALESCE(f.trial_ends_at, f.registered_at + INTERVAL '10 days') AS trial_ends_at,
+                f.subscription_ends_at::text AS subscription_ends_at
+         FROM families f
+         WHERE f.id::text = $1`,
+        [familyIdStr]
+      ),
+      pool.query(
+        `SELECT id, name, email, avatar_url, phone, birth_date, bio
+         FROM users WHERE id::text = $1`,
+        [access.userId]
+      ),
+      canRead
+        ? pool.query(
+            `SELECT id, name, bank_name, agency, account_number, pix_key, initial_balance, balance
+             FROM accounts
+             WHERE family_id::text = $1
+             ORDER BY name ASC`,
+            [familyIdStr]
+          )
+        : Promise.resolve({ rows: [] as any[] }),
+      canRead
+        ? pool.query(
+            `SELECT c.*, COUNT(t.id)::int AS transaction_count
+             FROM categories c
+             LEFT JOIN transactions t ON t.category_id = c.id
+             WHERE c.family_id::text = $1
+             GROUP BY c.id
+             ORDER BY c.name ASC`,
+            [familyIdStr]
+          )
+        : Promise.resolve({ rows: [] as any[] }),
+      canRead
+        ? pool.query(
+            `SELECT * FROM credit_cards WHERE family_id::text = $1 ORDER BY name ASC`,
+            [familyIdStr]
+          )
+        : Promise.resolve({ rows: [] as any[] }),
+      canRead
+        ? pool.query(
+            `SELECT t.*, c.name AS category_name, a.name AS account_name, cc.name AS credit_card_name
+             FROM transactions t
+             LEFT JOIN categories c ON t.category_id = c.id
+             LEFT JOIN accounts a ON t.account_id = a.id
+             LEFT JOIN credit_cards cc ON t.credit_card_id = cc.id
+             WHERE t.family_id::text = $1
+             ORDER BY t.due_date DESC`,
+            [familyIdStr]
+          )
+        : Promise.resolve({ rows: [] as any[] }),
+    ]);
+
+    const settingsMap = Object.fromEntries(settingsResult.rows.map(row => [row.key, row.value]));
+    const familyRow = familyResult.rows[0];
+    let categories = categoriesResult.rows;
+
+    if (canRead && !categories.some(c => String(c.name || '').toLowerCase() === 'investimento')) {
+      try {
+        const invRes = await pool.query(
+          `INSERT INTO categories (family_id, name, flow_type)
+           VALUES ($1, 'Investimento', 'EXPENSE')
+           RETURNING *`,
+          [familyIdStr]
+        );
+        if (invRes.rows[0]) {
+          categories = [...categories, { ...invRes.rows[0], transaction_count: 0 }].sort((a, b) =>
+            String(a.name).localeCompare(String(b.name), 'pt-BR')
+          );
+        }
+      } catch {
+        // Ignore race condition if inserted concurrently
+      }
+    }
+
+    return res.json({
+      access: {
+        familyId: access.familyId,
+        role: access.role,
+        permissions:
+          access.role === 'OWNER'
+            ? Object.fromEntries(FAMILY_PERMISSIONS.map(permission => [permission, true]))
+            : access.permissions,
+        broadcast: {
+          message: settingsMap.global_broadcast_message || '',
+          type: settingsMap.global_broadcast_type || 'INFO',
+        },
+        subscription: {
+          familyName: familyRow?.name || 'Família',
+          planType: familyRow?.plan_type || 'TRIAL',
+          registeredAt: familyRow?.registered_at || null,
+          trialEndsAt: familyRow?.trial_ends_at || null,
+          subscriptionEndsAt: familyRow?.subscription_ends_at || null,
+          contactPhone: settingsMap.tenant_support_phone || '(41) 0000-0000',
+        },
+      },
+      profile: profileResult.rows[0] || null,
+      accounts: accountsResult.rows,
+      categories,
+      creditCards: creditCardsResult.rows,
+      transactions: transactionsResult.rows,
+    });
+  } catch (error: any) {
+    console.error('Erro no bootstrap do dashboard:', error);
+    return res.status(500).json({ error: 'Não foi possível carregar os dados iniciais da família.' });
+  }
+});
+
 router.get('/api/internal/tenants', async (req: Request, res: Response): Promise<any> => {
   try {
     if (!await isInternalAdmin(req.familyAccess!.userId)) {
@@ -572,6 +701,7 @@ router.patch('/api/internal/tenants/:familyId/status', async (req: Request, res:
         ? res.status(403).json({ error: 'O tenant da conta administrativa não pode ser bloqueado.' })
         : res.status(404).json({ error: 'Tenant não encontrado.' });
     }
+    invalidateAuthMembershipCache();
     return res.json({
       id: result.rows[0].id,
       blocked_at: result.rows[0].blocked_at,
@@ -691,6 +821,7 @@ router.patch('/api/internal/tenants/:familyId/commercial', async (req: Request, 
       }
 
       await client.query('COMMIT');
+      invalidateAuthMembershipCache();
       return res.json({
         ...updatedFamilyRes.rows[0],
         owner_phone: nextOwnerPhone,
@@ -951,6 +1082,7 @@ router.put('/api/family/members/:userId/permissions', requireFamilyPermission('m
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Membro não encontrado ou sem permissão para editar.' });
     }
+    invalidateAuthMembershipCache(userId);
     return res.json({ message: 'Permissões atualizadas.' });
   } catch (error: any) {
     console.error('Erro ao atualizar permissões do membro:', error);
@@ -989,6 +1121,7 @@ router.delete('/api/family/members/:userId', requireFamilyPermission('members_ma
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Membro não encontrado ou não pode ser removido.' });
     }
+    invalidateAuthMembershipCache(userId);
     return res.json({ message: 'Membro removido da família.' });
   } catch (error: any) {
     console.error('Erro ao remover membro da família:', error);

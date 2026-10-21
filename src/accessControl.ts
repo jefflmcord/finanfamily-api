@@ -234,6 +234,16 @@ export async function initializeAccessControl(): Promise<void> {
     CREATE INDEX IF NOT EXISTS family_invitations_family_email_idx
       ON family_invitations (family_id, email)
   `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS users_lower_email_idx ON users (LOWER(email))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS users_id_text_idx ON users ((id::text))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS families_id_text_idx ON families ((id::text))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS family_members_user_id_idx ON family_members (user_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS family_members_family_id_idx ON family_members (family_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS accounts_family_id_idx ON accounts ((family_id::text))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS categories_family_id_idx ON categories ((family_id::text))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS credit_cards_family_id_idx ON credit_cards ((family_id::text))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS transactions_family_due_idx ON transactions ((family_id::text), due_date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS transactions_category_id_idx ON transactions (category_id)`);
   await pool.query(
     `INSERT INTO family_members (family_id, user_id, role, permissions)
      SELECT ranked.family_id, ranked.user_id,
@@ -255,6 +265,28 @@ export async function initializeAccessControl(): Promise<void> {
   );
 }
 
+interface CachedMembershipRow {
+  family_id: string;
+  user_id: string;
+  role: 'OWNER' | 'MEMBER';
+  permissions: Partial<Record<FamilyPermission, boolean>>;
+  blocked_at: string | Date | null;
+  email: string;
+  contact_phone: string | null;
+  expiresAt: number;
+}
+
+const authMembershipCache = new Map<string, CachedMembershipRow>();
+const AUTH_CACHE_TTL_MS = 4000;
+
+export function invalidateAuthMembershipCache(userId?: string): void {
+  if (userId) {
+    authMembershipCache.delete(String(userId));
+  } else {
+    authMembershipCache.clear();
+  }
+}
+
 export function authenticateFamilyMember(req: Request, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
@@ -269,18 +301,39 @@ export function authenticateFamilyMember(req: Request, res: Response, next: Next
       return;
     }
 
+    const userIdKey = String(decoded.id);
+    const now = Date.now();
+    const cached = authMembershipCache.get(userIdKey);
+
     try {
-      const result = await pool.query(
-        `SELECT fm.family_id, fm.user_id, fm.role, fm.permissions,
-                f.blocked_at, u.email,
-                (SELECT value FROM system_settings WHERE key = 'tenant_support_phone') AS contact_phone
-         FROM family_members fm
-         JOIN families f ON f.id::text = fm.family_id
-         JOIN users u ON u.id::text = fm.user_id
-         WHERE fm.user_id = $1`,
-        [String(decoded.id)]
-      );
-      const membership = result.rows[0];
+      let membership: CachedMembershipRow | undefined = cached && cached.expiresAt > now ? cached : undefined;
+      if (!membership) {
+        const result = await pool.query(
+          `SELECT fm.family_id, fm.user_id, fm.role, fm.permissions,
+                  f.blocked_at, u.email,
+                  (SELECT value FROM system_settings WHERE key = 'tenant_support_phone') AS contact_phone
+           FROM family_members fm
+           JOIN families f ON f.id::text = fm.family_id
+           JOIN users u ON u.id::text = fm.user_id
+           WHERE fm.user_id = $1`,
+          [userIdKey]
+        );
+        const row = result.rows[0];
+        if (row) {
+          membership = {
+            family_id: String(row.family_id),
+            user_id: String(row.user_id),
+            role: row.role,
+            permissions: row.permissions || {},
+            blocked_at: row.blocked_at || null,
+            email: String(row.email || ''),
+            contact_phone: row.contact_phone || null,
+            expiresAt: now + AUTH_CACHE_TTL_MS,
+          };
+          authMembershipCache.set(userIdKey, membership);
+        }
+      }
+
       if (!membership) {
         res.status(403).json({ error: 'Este usuário não está vinculado a uma família ativa.' });
         return;

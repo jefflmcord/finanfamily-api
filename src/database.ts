@@ -9,6 +9,10 @@ export const pool = new Pool(
   connectionString
     ? {
         connectionString,
+        max: 12,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000,
+        keepAlive: true,
         ssl: {
           rejectUnauthorized: false, // Obrigatório para conexões remotas seguras com Neon/Render
         },
@@ -19,6 +23,9 @@ export const pool = new Pool(
         user: process.env.DB_USER || 'postgres',
         password: process.env.DB_PASSWORD,
         database: process.env.DB_NAME || 'finanfamily',
+        max: 12,
+        idleTimeoutMillis: 30000,
+        keepAlive: true,
       }
 );
 

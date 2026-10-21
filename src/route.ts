@@ -26,8 +26,11 @@ function addMonthsToDate(dateValue: string, monthOffset: number): string {
   return targetMonth.toISOString().split('T')[0];
 }
 
-// Rota raiz para teste de status
+// Rota raiz para teste de status e aquecimento de conexão
 router.get('/', (req: Request, res: Response) => {
+  if (req.query.warmup) {
+    pool.query('SELECT 1').catch(() => {});
+  }
   return res.status(200).json({ status: 'online', message: 'API FinanFamily a funcionar perfeitamente!' });
 });
 
@@ -59,7 +62,7 @@ router.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   }
 
   try {
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.trim().toLowerCase()]);
+    const result = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [email.trim().toLowerCase()]);
     const user = result.rows[0];
 
     if (!user || !user.password_hash) {
@@ -411,28 +414,35 @@ router.delete('/api/accounts/:id', requireFamilyPermission('accounts_manage'), a
 
 // 4. CATEGORIAS
 router.get('/api/categories', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {
-  const family_id = req.familyAccess!.familyId;
+  const family_id = String(req.familyAccess!.familyId);
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    await ensureInvestmentCategory(client, String(family_id));
-    const result = await client.query(
+    const result = await pool.query(
       `SELECT c.*, COUNT(t.id)::int AS transaction_count
        FROM categories c
        LEFT JOIN transactions t ON t.category_id = c.id
-       WHERE c.family_id = $1
+       WHERE c.family_id::text = $1
        GROUP BY c.id
        ORDER BY c.name ASC`,
-      [String(family_id)]
+      [family_id]
     );
-    await client.query('COMMIT');
-    return res.json(result.rows);
+    let rows = result.rows;
+    if (!rows.some(c => String(c.name || '').toLowerCase() === 'investimento')) {
+      const invRes = await pool.query(
+        `INSERT INTO categories (family_id, name, flow_type)
+         VALUES ($1, 'Investimento', 'EXPENSE')
+         RETURNING *`,
+        [family_id]
+      );
+      if (invRes.rows[0]) {
+        rows = [...rows, { ...invRes.rows[0], transaction_count: 0 }].sort((a, b) =>
+          String(a.name).localeCompare(String(b.name), 'pt-BR')
+        );
+      }
+    }
+    return res.json(rows);
   } catch (err: any) {
-    await client.query('ROLLBACK');
     return res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
   }
 });
 
