@@ -16,6 +16,7 @@ const router = Router();
 
 const VALID_PLAN_TYPES = ['TRIAL', 'MONTHLY', 'ANNUAL', 'COURTESY'] as const;
 const VALID_BROADCAST_TYPES = ['INFO', 'SUCCESS', 'WARNING'] as const;
+const VALID_LEAD_STATUSES = ['NEW', 'CONTACTED', 'CONVERTED', 'ARCHIVED'] as const;
 
 async function isInternalAdmin(userId: string): Promise<boolean> {
   const result = await pool.query(
@@ -24,6 +25,46 @@ async function isInternalAdmin(userId: string): Promise<boolean> {
   );
   return result.rows.length > 0;
 }
+
+publicRouter.post('/api/public/leads/ebook', async (req: Request, res: Response): Promise<any> => {
+  const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  const name = rawName ? rawName.slice(0, 120) : 'Visitante';
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const whatsapp = typeof req.body?.whatsapp === 'string' ? req.body.whatsapp.trim().slice(0, 40) : '';
+  const digitCount = whatsapp.replace(/\D/g, '').length;
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Informe um e-mail válido para baixar o e-book.' });
+  }
+  if (digitCount < 8 || digitCount > 15) {
+    return res.status(400).json({ error: 'Informe um WhatsApp válido com DDD.' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO marketing_leads (name, email, whatsapp, source)
+       VALUES ($1, $2, $3, 'EBOOK_10_PASSOS')
+       ON CONFLICT (email)
+       DO UPDATE SET
+         name = CASE WHEN EXCLUDED.name <> 'Visitante' THEN EXCLUDED.name ELSE marketing_leads.name END,
+         whatsapp = EXCLUDED.whatsapp,
+         download_count = marketing_leads.download_count + 1,
+         updated_at = NOW()
+       RETURNING id, name, email, whatsapp, status, download_count, created_at`,
+      [name, email, whatsapp]
+    );
+
+    await pool.query(
+      `UPDATE users SET phone = COALESCE(NULLIF(phone, ''), $1) WHERE LOWER(email) = $2`,
+      [whatsapp, email]
+    );
+
+    return res.status(201).json({ success: true, lead: result.rows[0] });
+  } catch (error: any) {
+    console.error('Erro ao registrar lead do e-book:', error);
+    return res.status(500).json({ error: 'Não foi possível registrar seus dados no momento.' });
+  }
+});
 
 publicRouter.post('/api/family-invitations/accept', async (req: Request, res: Response): Promise<any> => {
   const { token, name, password } = req.body;
@@ -186,7 +227,7 @@ router.get('/api/internal/tenants', async (req: Request, res: Response): Promise
       return res.status(403).json({ error: 'Acesso não autorizado.' });
     }
 
-    const [tenantsResult, settingsResult] = await Promise.all([
+    const [tenantsResult, settingsResult, leadsResult] = await Promise.all([
       pool.query(
         `SELECT f.id,
                 f.name,
@@ -214,12 +255,33 @@ router.get('/api/internal/tenants', async (req: Request, res: Response): Promise
       pool.query(
         `SELECT key, value FROM system_settings WHERE key IN ('tenant_support_phone', 'global_broadcast_message', 'global_broadcast_type')`
       ),
+      pool.query(
+        `SELECT ml.id,
+                ml.name,
+                ml.email,
+                ml.whatsapp,
+                ml.source,
+                ml.status,
+                COALESCE(ml.notes, '') AS notes,
+                ml.download_count,
+                ml.created_at,
+                ml.updated_at,
+                u.id AS matched_user_id,
+                f.id AS matched_family_id,
+                f.name AS matched_family_name,
+                COALESCE(f.plan_type, 'TRIAL') AS matched_plan_type
+         FROM marketing_leads ml
+         LEFT JOIN users u ON LOWER(u.email) = LOWER(ml.email)
+         LEFT JOIN families f ON f.id::text = u.family_id::text
+         ORDER BY ml.created_at DESC`
+      ),
     ]);
 
     const settingsMap = Object.fromEntries(settingsResult.rows.map(row => [row.key, row.value]));
 
     return res.json({
       tenants: tenantsResult.rows,
+      leads: leadsResult.rows,
       contactPhone: settingsMap.tenant_support_phone || '(41) 0000-0000',
       broadcastMessage: settingsMap.global_broadcast_message || '',
       broadcastType: settingsMap.global_broadcast_type || 'INFO',
@@ -227,6 +289,57 @@ router.get('/api/internal/tenants', async (req: Request, res: Response): Promise
   } catch (error: any) {
     console.error('Erro ao carregar relatório interno de tenants:', error);
     return res.status(500).json({ error: 'Não foi possível carregar o relatório interno.' });
+  }
+});
+
+router.patch('/api/internal/leads/:leadId', async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!await isInternalAdmin(req.familyAccess!.userId)) {
+      return res.status(403).json({ error: 'Acesso não autorizado.' });
+    }
+    const leadId = String(req.params.leadId);
+    const rawStatus = typeof req.body?.status === 'string' ? req.body.status.toUpperCase() : undefined;
+    const status = rawStatus && (VALID_LEAD_STATUSES as readonly string[]).includes(rawStatus)
+      ? rawStatus
+      : undefined;
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes.trim().slice(0, 1000) : undefined;
+
+    const result = await pool.query(
+      `UPDATE marketing_leads
+       SET status = COALESCE($1, status),
+           notes = COALESCE($2, notes),
+           updated_at = NOW()
+       WHERE id::text = $3
+       RETURNING id, name, email, whatsapp, source, status, COALESCE(notes, '') AS notes, download_count, created_at, updated_at`,
+      [status ?? null, notes ?? null, leadId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Lead não encontrado.' });
+    }
+    return res.json(result.rows[0]);
+  } catch (error: any) {
+    console.error('Erro ao atualizar lead comercial:', error);
+    return res.status(500).json({ error: 'Não foi possível atualizar o lead.' });
+  }
+});
+
+router.delete('/api/internal/leads/:leadId', async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!await isInternalAdmin(req.familyAccess!.userId)) {
+      return res.status(403).json({ error: 'Acesso não autorizado.' });
+    }
+    const leadId = String(req.params.leadId);
+    const result = await pool.query(
+      `DELETE FROM marketing_leads WHERE id::text = $1 RETURNING id`,
+      [leadId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Lead não encontrado.' });
+    }
+    return res.json({ message: 'Lead removido.' });
+  } catch (error: any) {
+    console.error('Erro ao excluir lead comercial:', error);
+    return res.status(500).json({ error: 'Não foi possível excluir o lead.' });
   }
 });
 

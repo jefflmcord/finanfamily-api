@@ -129,6 +129,20 @@ export async function initializeAccessControl(): Promise<void> {
     )
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS marketing_leads (
+      id BIGSERIAL PRIMARY KEY,
+      name VARCHAR(120) NOT NULL,
+      email VARCHAR(180) NOT NULL UNIQUE,
+      whatsapp VARCHAR(40) NOT NULL,
+      source VARCHAR(80) NOT NULL DEFAULT 'EBOOK_10_PASSOS',
+      status TEXT NOT NULL DEFAULT 'NEW' CHECK (status IN ('NEW', 'CONTACTED', 'CONVERTED', 'ARCHIVED')),
+      notes TEXT,
+      download_count INT NOT NULL DEFAULT 1,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS annual_provisions (
       id BIGSERIAL PRIMARY KEY,
       family_id TEXT NOT NULL,
