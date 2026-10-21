@@ -14,6 +14,9 @@ const JWT_SECRET = process.env.JWT_SECRET || 'finanfamily_secreto_2026';
 const publicRouter = Router();
 const router = Router();
 
+const VALID_PLAN_TYPES = ['TRIAL', 'MONTHLY', 'ANNUAL', 'COURTESY'] as const;
+const VALID_BROADCAST_TYPES = ['INFO', 'SUCCESS', 'WARNING'] as const;
+
 async function isInternalAdmin(userId: string): Promise<boolean> {
   const result = await pool.query(
     'SELECT 1 FROM users WHERE id::text = $1 AND LOWER(email) = $2',
@@ -149,13 +152,32 @@ publicRouter.get('/api/family-invitations/preview', async (req: Request, res: Re
 
 router.get('/api/family/access', async (req: Request, res: Response): Promise<any> => {
   const access = req.familyAccess!;
-  return res.json({
-    familyId: access.familyId,
-    role: access.role,
-    permissions: access.role === 'OWNER'
-      ? Object.fromEntries(FAMILY_PERMISSIONS.map(permission => [permission, true]))
-      : access.permissions,
-  });
+  try {
+    const settingsResult = await pool.query(
+      `SELECT key, value FROM system_settings WHERE key IN ('global_broadcast_message', 'global_broadcast_type')`
+    );
+    const settingsMap = Object.fromEntries(settingsResult.rows.map(row => [row.key, row.value]));
+    return res.json({
+      familyId: access.familyId,
+      role: access.role,
+      permissions: access.role === 'OWNER'
+        ? Object.fromEntries(FAMILY_PERMISSIONS.map(permission => [permission, true]))
+        : access.permissions,
+      broadcast: {
+        message: settingsMap.global_broadcast_message || '',
+        type: settingsMap.global_broadcast_type || 'INFO',
+      },
+    });
+  } catch {
+    return res.json({
+      familyId: access.familyId,
+      role: access.role,
+      permissions: access.role === 'OWNER'
+        ? Object.fromEntries(FAMILY_PERMISSIONS.map(permission => [permission, true]))
+        : access.permissions,
+      broadcast: { message: '', type: 'INFO' },
+    });
+  }
 });
 
 router.get('/api/internal/tenants', async (req: Request, res: Response): Promise<any> => {
@@ -166,20 +188,41 @@ router.get('/api/internal/tenants', async (req: Request, res: Response): Promise
 
     const [tenantsResult, settingsResult] = await Promise.all([
       pool.query(
-        `SELECT f.id, f.name, f.registered_at,
+        `SELECT f.id,
+                f.name,
+                f.registered_at,
                 f.blocked_at,
-                u.name AS owner_name, u.email AS owner_email
+                COALESCE(f.plan_type, 'TRIAL') AS plan_type,
+                COALESCE(f.trial_ends_at, f.registered_at + INTERVAL '10 days') AS trial_ends_at,
+                f.subscription_ends_at::text AS subscription_ends_at,
+                COALESCE(f.admin_notes, '') AS admin_notes,
+                u.id AS owner_id,
+                u.name AS owner_name,
+                u.email AS owner_email,
+                u.phone AS owner_phone,
+                (SELECT COUNT(*)::int FROM family_members fm2 WHERE fm2.family_id = f.id::text) AS members_count,
+                (SELECT COUNT(*)::int FROM accounts a WHERE a.family_id::text = f.id::text) AS accounts_count,
+                (SELECT COUNT(*)::int FROM credit_cards cc WHERE cc.family_id::text = f.id::text) AS cards_count,
+                (SELECT COUNT(*)::int FROM transactions t WHERE t.family_id::text = f.id::text) AS transactions_count,
+                (SELECT MAX(t.transaction_date)::text FROM transactions t WHERE t.family_id::text = f.id::text) AS last_transaction_date
          FROM families f
          LEFT JOIN family_members fm
            ON fm.family_id = f.id::text AND fm.role = 'OWNER'
          LEFT JOIN users u ON u.id::text = fm.user_id
          ORDER BY f.registered_at DESC NULLS LAST, f.id DESC`
       ),
-      pool.query(`SELECT value FROM system_settings WHERE key = 'tenant_support_phone'`),
+      pool.query(
+        `SELECT key, value FROM system_settings WHERE key IN ('tenant_support_phone', 'global_broadcast_message', 'global_broadcast_type')`
+      ),
     ]);
+
+    const settingsMap = Object.fromEntries(settingsResult.rows.map(row => [row.key, row.value]));
+
     return res.json({
       tenants: tenantsResult.rows,
-      contactPhone: settingsResult.rows[0]?.value || '(41) 0000-0000',
+      contactPhone: settingsMap.tenant_support_phone || '(41) 0000-0000',
+      broadcastMessage: settingsMap.global_broadcast_message || '',
+      broadcastType: settingsMap.global_broadcast_type || 'INFO',
     });
   } catch (error: any) {
     console.error('Erro ao carregar relatório interno de tenants:', error);
@@ -211,6 +254,35 @@ router.put('/api/internal/contact-phone', async (req: Request, res: Response): P
   } catch (error: any) {
     console.error('Erro ao atualizar o telefone de contato interno:', error);
     return res.status(500).json({ error: 'Não foi possível salvar o telefone de contato.' });
+  }
+});
+
+router.put('/api/internal/broadcast', async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!await isInternalAdmin(req.familyAccess!.userId)) {
+      return res.status(403).json({ error: 'Acesso não autorizado.' });
+    }
+    const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    const rawType = typeof req.body?.type === 'string' ? req.body.type.toUpperCase() : 'INFO';
+    const type = (VALID_BROADCAST_TYPES as readonly string[]).includes(rawType) ? rawType : 'INFO';
+
+    if (message.length > 400) {
+      return res.status(400).json({ error: 'O comunicado deve ter até 400 caracteres.' });
+    }
+
+    await pool.query(
+      `INSERT INTO system_settings (key, value, updated_at)
+       VALUES ('global_broadcast_message', $1, NOW()),
+              ('global_broadcast_type', $2, NOW())
+       ON CONFLICT (key)
+       DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [message, type]
+    );
+
+    return res.json({ broadcastMessage: message, broadcastType: type });
+  } catch (error: any) {
+    console.error('Erro ao salvar comunicado global:', error);
+    return res.status(500).json({ error: 'Não foi possível salvar o comunicado global.' });
   }
 });
 
@@ -256,6 +328,172 @@ router.patch('/api/internal/tenants/:familyId/status', async (req: Request, res:
   } catch (error: any) {
     console.error('Erro ao alterar o acesso do tenant:', error);
     return res.status(500).json({ error: 'Não foi possível alterar o acesso do tenant.' });
+  }
+});
+
+router.patch('/api/internal/tenants/:familyId/commercial', async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!await isInternalAdmin(req.familyAccess!.userId)) {
+      return res.status(403).json({ error: 'Acesso não autorizado.' });
+    }
+
+    const familyId = String(req.params.familyId);
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const currentRes = await client.query(
+        `SELECT f.id,
+                f.registered_at,
+                f.blocked_at,
+                COALESCE(f.plan_type, 'TRIAL') AS plan_type,
+                COALESCE(f.trial_ends_at, f.registered_at + INTERVAL '10 days', NOW() + INTERVAL '10 days') AS trial_ends_at,
+                f.subscription_ends_at::text AS subscription_ends_at,
+                COALESCE(f.admin_notes, '') AS admin_notes,
+                u.id AS owner_id,
+                u.phone AS owner_phone
+         FROM families f
+         LEFT JOIN family_members fm ON fm.family_id = f.id::text AND fm.role = 'OWNER'
+         LEFT JOIN users u ON u.id::text = fm.user_id
+         WHERE f.id::text = $1
+         FOR UPDATE OF f`,
+        [familyId]
+      );
+
+      const current = currentRes.rows[0];
+      if (!current) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Tenant não encontrado.' });
+      }
+
+      let nextPlanType = current.plan_type;
+      if (typeof body.plan_type === 'string' && (VALID_PLAN_TYPES as readonly string[]).includes(body.plan_type)) {
+        nextPlanType = body.plan_type;
+      }
+
+      let nextTrialEndsAt: string | Date = current.trial_ends_at;
+      if (typeof body.extend_trial_days === 'number' && Number.isFinite(body.extend_trial_days)) {
+        const baseTime = Math.max(Date.now(), new Date(current.trial_ends_at).getTime());
+        nextTrialEndsAt = new Date(baseTime + body.extend_trial_days * 24 * 60 * 60 * 1000).toISOString();
+      } else if (typeof body.trial_ends_at === 'string' && body.trial_ends_at.trim()) {
+        const parsedTrial = new Date(body.trial_ends_at);
+        if (Number.isNaN(parsedTrial.getTime())) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: 'Data de término do teste inválida.' });
+        }
+        nextTrialEndsAt = parsedTrial.toISOString();
+      }
+
+      let nextSubscriptionEndsAt: string | null = current.subscription_ends_at;
+      if (body.subscription_ends_at === null || body.subscription_ends_at === '') {
+        nextSubscriptionEndsAt = null;
+      } else if (typeof body.subscription_ends_at === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.subscription_ends_at)) {
+        nextSubscriptionEndsAt = body.subscription_ends_at;
+      }
+
+      if (body.activate_cycle === 'MONTHLY' || body.activate_cycle === 'ANNUAL') {
+        nextPlanType = body.activate_cycle;
+        const baseDate = nextSubscriptionEndsAt && new Date(`${nextSubscriptionEndsAt}T00:00:00Z`).getTime() > Date.now()
+          ? new Date(`${nextSubscriptionEndsAt}T00:00:00Z`)
+          : new Date();
+        if (body.activate_cycle === 'MONTHLY') {
+          baseDate.setUTCMonth(baseDate.getUTCMonth() + 1);
+        } else {
+          baseDate.setUTCFullYear(baseDate.getUTCFullYear() + 1);
+        }
+        nextSubscriptionEndsAt = baseDate.toISOString().slice(0, 10);
+      }
+
+      const nextAdminNotes = typeof body.admin_notes === 'string'
+        ? body.admin_notes.trim().slice(0, 1000)
+        : current.admin_notes;
+
+      const unblockOnActivate = Boolean(body.activate_cycle);
+
+      const updatedFamilyRes = await client.query(
+        `UPDATE families
+         SET plan_type = $1,
+             trial_ends_at = $2,
+             subscription_ends_at = $3,
+             admin_notes = $4,
+             blocked_at = CASE WHEN $5::boolean THEN NULL ELSE blocked_at END
+         WHERE id::text = $6
+         RETURNING id,
+                   plan_type,
+                   trial_ends_at,
+                   subscription_ends_at::text AS subscription_ends_at,
+                   COALESCE(admin_notes, '') AS admin_notes,
+                   blocked_at`,
+        [nextPlanType, nextTrialEndsAt, nextSubscriptionEndsAt, nextAdminNotes, unblockOnActivate, familyId]
+      );
+
+      let nextOwnerPhone = current.owner_phone || null;
+      if (typeof body.owner_phone === 'string' && current.owner_id) {
+        const cleanPhone = body.owner_phone.trim().slice(0, 30);
+        const phoneRes = await client.query(
+          `UPDATE users SET phone = $1 WHERE id::text = $2 RETURNING phone`,
+          [cleanPhone || null, String(current.owner_id)]
+        );
+        nextOwnerPhone = phoneRes.rows[0]?.phone || null;
+      }
+
+      await client.query('COMMIT');
+      return res.json({
+        ...updatedFamilyRes.rows[0],
+        owner_phone: nextOwnerPhone,
+      });
+    } catch (txError) {
+      await client.query('ROLLBACK');
+      throw txError;
+    } finally {
+      client.release();
+    }
+  } catch (error: any) {
+    console.error('Erro ao atualizar dados comerciais do tenant:', error);
+    return res.status(500).json({ error: 'Não foi possível salvar os dados comerciais do tenant.' });
+  }
+});
+
+router.post('/api/internal/tenants/:familyId/reset-password', async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!await isInternalAdmin(req.familyAccess!.userId)) {
+      return res.status(403).json({ error: 'Acesso não autorizado.' });
+    }
+
+    const familyId = String(req.params.familyId);
+    const newPassword = typeof req.body?.new_password === 'string' ? req.body.new_password.trim() : '';
+    if (newPassword.length < 6 || newPassword.length > 64) {
+      return res.status(400).json({ error: 'A senha temporária deve ter entre 6 e 64 caracteres.' });
+    }
+
+    const ownerResult = await pool.query(
+      `SELECT u.id, u.email, u.name
+       FROM family_members fm
+       JOIN users u ON u.id::text = fm.user_id
+       WHERE fm.family_id = $1 AND fm.role = 'OWNER'
+       LIMIT 1`,
+      [familyId]
+    );
+    const owner = ownerResult.rows[0];
+    if (!owner) {
+      return res.status(404).json({ error: 'Responsável pela família não encontrado.' });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await pool.query(
+      `UPDATE users SET password_hash = $1 WHERE id::text = $2`,
+      [passwordHash, String(owner.id)]
+    );
+
+    return res.json({
+      message: `Senha redefinida com sucesso para ${owner.email}.`,
+      owner_email: owner.email,
+    });
+  } catch (error: any) {
+    console.error('Erro ao redefinir senha administrativa do tenant:', error);
+    return res.status(500).json({ error: 'Não foi possível redefinir a senha do responsável.' });
   }
 });
 

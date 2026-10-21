@@ -105,11 +105,21 @@ export async function initializeAccessControl(): Promise<void> {
   await pool.query(`
     ALTER TABLE families
       ADD COLUMN IF NOT EXISTS registered_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ
+      ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS plan_type TEXT NOT NULL DEFAULT 'TRIAL',
+      ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS subscription_ends_at DATE,
+      ADD COLUMN IF NOT EXISTS admin_notes TEXT
   `);
   await pool.query(`
     ALTER TABLE families
-      ALTER COLUMN registered_at SET DEFAULT NOW()
+      ALTER COLUMN registered_at SET DEFAULT NOW(),
+      ALTER COLUMN trial_ends_at SET DEFAULT (NOW() + INTERVAL '10 days')
+  `);
+  await pool.query(`
+    UPDATE families
+    SET trial_ends_at = COALESCE(registered_at, NOW()) + INTERVAL '10 days'
+    WHERE trial_ends_at IS NULL
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS system_settings (
@@ -161,7 +171,10 @@ export async function initializeAccessControl(): Promise<void> {
   `);
   await pool.query(
     `INSERT INTO system_settings (key, value)
-     VALUES ('tenant_support_phone', $1)
+     VALUES
+       ('tenant_support_phone', $1),
+       ('global_broadcast_message', ''),
+       ('global_broadcast_type', 'INFO')
      ON CONFLICT (key) DO NOTHING`,
     [DEFAULT_SUPPORT_PHONE]
   );
