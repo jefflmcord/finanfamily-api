@@ -111,7 +111,8 @@ export async function initializeAccessControl(): Promise<void> {
       ADD COLUMN IF NOT EXISTS plan_type TEXT NOT NULL DEFAULT 'TRIAL',
       ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS subscription_ends_at DATE,
-      ADD COLUMN IF NOT EXISTS admin_notes TEXT
+      ADD COLUMN IF NOT EXISTS admin_notes TEXT,
+      ADD COLUMN IF NOT EXISTS enabled_modules JSONB NOT NULL DEFAULT '["financeiro","mercado"]'::jsonb
   `);
   await pool.query(`
     ALTER TABLE families
@@ -179,6 +180,67 @@ export async function initializeAccessControl(): Promise<void> {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS annual_provision_contributions_provision_date_idx
       ON annual_provision_contributions (provision_id, contribution_date DESC)
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shopping_lists (
+      id BIGSERIAL PRIMARY KEY,
+      family_id TEXT NOT NULL,
+      name VARCHAR(140) NOT NULL,
+      store_name VARCHAR(120),
+      budget_limit NUMERIC(12, 2) NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'COMPLETED')),
+      completed_at TIMESTAMPTZ,
+      total_spent NUMERIC(12, 2) NOT NULL DEFAULT 0,
+      linked_transaction_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shopping_list_items (
+      id BIGSERIAL PRIMARY KEY,
+      list_id BIGINT NOT NULL REFERENCES shopping_lists(id) ON DELETE CASCADE,
+      family_id TEXT NOT NULL,
+      name VARCHAR(140) NOT NULL,
+      aisle_category VARCHAR(60) NOT NULL DEFAULT 'Mercearia',
+      quantity NUMERIC(10, 3) NOT NULL DEFAULT 1,
+      unit VARCHAR(20) NOT NULL DEFAULT 'un',
+      unit_price NUMERIC(12, 2) NOT NULL DEFAULT 0,
+      last_paid_price NUMERIC(12, 2),
+      is_checked BOOLEAN NOT NULL DEFAULT FALSE,
+      notes VARCHAR(200),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shopping_price_history (
+      id BIGSERIAL PRIMARY KEY,
+      family_id TEXT NOT NULL,
+      normalized_name VARCHAR(140) NOT NULL,
+      display_name VARCHAR(140) NOT NULL,
+      aisle_category VARCHAR(60) NOT NULL DEFAULT 'Mercearia',
+      unit VARCHAR(20) NOT NULL DEFAULT 'un',
+      last_price NUMERIC(12, 2) NOT NULL,
+      previous_price NUMERIC(12, 2),
+      min_price NUMERIC(12, 2) NOT NULL,
+      max_price NUMERIC(12, 2) NOT NULL,
+      last_store VARCHAR(120),
+      purchase_count INT NOT NULL DEFAULT 1,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (family_id, normalized_name)
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS shopping_lists_family_status_idx
+      ON shopping_lists (family_id, status, created_at DESC)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS shopping_list_items_list_idx
+      ON shopping_list_items (list_id, aisle_category, id)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS shopping_price_history_family_idx
+      ON shopping_price_history (family_id, updated_at DESC)
   `);
   await pool.query(`
     UPDATE family_members
