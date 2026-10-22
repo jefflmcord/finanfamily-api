@@ -100,7 +100,9 @@ export async function initializeAccessControl(): Promise<void> {
     ALTER TABLE users
       ADD COLUMN IF NOT EXISTS phone TEXT,
       ADD COLUMN IF NOT EXISTS birth_date DATE,
-      ADD COLUMN IF NOT EXISTS bio VARCHAR(280)
+      ADD COLUMN IF NOT EXISTS bio VARCHAR(280),
+      ADD COLUMN IF NOT EXISTS reset_token TEXT,
+      ADD COLUMN IF NOT EXISTS reset_token_expires_at TIMESTAMPTZ
   `);
   await pool.query(`
     ALTER TABLE families

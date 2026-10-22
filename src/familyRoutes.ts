@@ -184,6 +184,138 @@ publicRouter.post('/api/public/leads/ebook', async (req: Request, res: Response)
   }
 });
 
+publicRouter.post('/api/public/recover-password', async (req: Request, res: Response): Promise<any> => {
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const whatsapp = typeof req.body?.whatsapp === 'string' ? req.body.whatsapp.trim() : '';
+  const newPassword = typeof req.body?.new_password === 'string' ? req.body.new_password : '';
+  const inputDigits = whatsapp.replace(/\D/g, '');
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Informe o e-mail cadastrado na sua conta.' });
+  }
+  if (inputDigits.length < 8) {
+    return res.status(400).json({ error: 'Informe o WhatsApp cadastrado na conta com DDD.' });
+  }
+  if (newPassword.length < 6 || newPassword.length > 64) {
+    return res.status(400).json({ error: 'A nova senha deve ter entre 6 e 64 caracteres.' });
+  }
+
+  try {
+    const [userRes, settingRes] = await Promise.all([
+      pool.query(
+        `SELECT u.id, u.email, u.phone,
+                (SELECT ml.whatsapp FROM marketing_leads ml WHERE LOWER(ml.email) = LOWER(u.email) LIMIT 1) AS lead_whatsapp
+         FROM users u
+         WHERE LOWER(u.email) = $1
+         LIMIT 1`,
+        [email]
+      ),
+      pool.query(`SELECT value FROM system_settings WHERE key = 'tenant_support_phone'`),
+    ]);
+
+    const supportPhone = settingRes.rows[0]?.value || '(41) 0000-0000';
+    const user = userRes.rows[0];
+    if (!user) {
+      return res.status(404).json({ error: 'Não encontramos nenhuma conta cadastrada com este e-mail.' });
+    }
+
+    const storedPhoneRaw = String(user.phone || user.lead_whatsapp || '');
+    const storedDigits = storedPhoneRaw.replace(/\D/g, '');
+
+    if (storedDigits.length < 8) {
+      return res.status(409).json({
+        code: 'PHONE_NOT_REGISTERED',
+        contact_phone: supportPhone,
+        error:
+          'Esta conta ainda não possui WhatsApp vinculado para validação automática. Solicite a redefinição rápida pelo suporte abaixo.',
+      });
+    }
+
+    // Compara os últimos 8 dígitos para tolerar presença/ausência do 9º dígito ou DDI 55
+    const storedSuffix = storedDigits.slice(-8);
+    const inputSuffix = inputDigits.slice(-8);
+    if (storedSuffix !== inputSuffix) {
+      return res.status(401).json({
+        error: 'O WhatsApp informado não confere com o telefone cadastrado para este e-mail.',
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await pool.query(
+      `UPDATE users
+       SET password_hash = $1,
+           phone = COALESCE(NULLIF(phone, ''), $2),
+           reset_token = NULL,
+           reset_token_expires_at = NULL
+       WHERE id = $3`,
+      [passwordHash, whatsapp, user.id]
+    );
+
+    return res.json({ message: 'Sua senha foi redefinida com sucesso! Você já pode entrar.' });
+  } catch (error: any) {
+    console.error('Erro na recuperação de senha:', error);
+    return res.status(500).json({ error: 'Não foi possível redefinir sua senha no momento.' });
+  }
+});
+
+publicRouter.post('/api/forgot-password', async (req: Request, res: Response): Promise<any> => {
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Informe um e-mail válido.' });
+  }
+
+  try {
+    const { token, tokenHash } = createInvitationToken();
+    await pool.query(
+      `UPDATE users
+       SET reset_token = $1,
+           reset_token_expires_at = NOW() + INTERVAL '2 hours'
+       WHERE LOWER(email) = $2`,
+      [tokenHash, email]
+    );
+    return res.json({
+      message: 'Se o e-mail estiver cadastrado, as instruções de recuperação foram processadas.',
+      reset_token_created: Boolean(token),
+    });
+  } catch (error: any) {
+    console.error('Erro ao solicitar token de redefinição:', error);
+    return res.status(500).json({ error: 'Não foi possível processar a solicitação.' });
+  }
+});
+
+publicRouter.post('/api/reset-password', async (req: Request, res: Response): Promise<any> => {
+  const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+  const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+
+  if (!token || newPassword.length < 6 || newPassword.length > 64) {
+    return res.status(400).json({ error: 'Token válido e senha com no mínimo 6 caracteres são obrigatórios.' });
+  }
+
+  try {
+    const tokenHash = hashInvitationToken(token);
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    const result = await pool.query(
+      `UPDATE users
+       SET password_hash = $1,
+           reset_token = NULL,
+           reset_token_expires_at = NULL
+       WHERE (reset_token = $2 OR reset_token = $3)
+         AND (reset_token_expires_at IS NULL OR reset_token_expires_at > NOW())
+       RETURNING id`,
+      [passwordHash, tokenHash, token]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(410).json({ error: 'Este link de recuperação expirou ou já foi utilizado.' });
+    }
+
+    return res.json({ message: 'Senha atualizada com sucesso!' });
+  } catch (error: any) {
+    console.error('Erro ao redefinir senha com token:', error);
+    return res.status(500).json({ error: 'Não foi possível redefinir a senha.' });
+  }
+});
+
 publicRouter.post('/api/family-invitations/accept', async (req: Request, res: Response): Promise<any> => {
   const { token, name, password } = req.body;
   if (typeof token !== 'string' || !token || typeof name !== 'string' ||
@@ -389,7 +521,8 @@ router.get('/api/family/bootstrap', async (req: Request, res: Response): Promise
         [familyIdStr]
       ),
       pool.query(
-        `SELECT id, name, email, avatar_url, phone, birth_date, bio
+        `SELECT id, name, email, avatar_url, phone, birth_date, bio,
+                (password_hash IS NOT NULL) AS has_password
          FROM users WHERE id::text = $1`,
         [access.userId]
       ),
@@ -882,7 +1015,8 @@ router.post('/api/internal/tenants/:familyId/reset-password', async (req: Reques
 router.get('/api/family/profile', async (req: Request, res: Response): Promise<any> => {
   try {
     const result = await pool.query(
-      `SELECT id, name, email, avatar_url, phone, birth_date, bio
+      `SELECT id, name, email, avatar_url, phone, birth_date, bio,
+              (password_hash IS NOT NULL) AS has_password
        FROM users WHERE id::text = $1`,
       [req.familyAccess!.userId]
     );
@@ -893,6 +1027,52 @@ router.get('/api/family/profile', async (req: Request, res: Response): Promise<a
   } catch (error: any) {
     console.error('Erro ao carregar perfil do usuário:', error);
     return res.status(500).json({ error: 'Não foi possível carregar seu perfil.' });
+  }
+});
+
+router.put('/api/family/password', async (req: Request, res: Response): Promise<any> => {
+  const currentPassword = typeof req.body?.current_password === 'string' ? req.body.current_password : '';
+  const newPassword = typeof req.body?.new_password === 'string' ? req.body.new_password : '';
+
+  if (newPassword.length < 6 || newPassword.length > 64) {
+    return res.status(400).json({ error: 'A nova senha deve ter entre 6 e 64 caracteres.' });
+  }
+
+  try {
+    const userRes = await pool.query(
+      'SELECT id, password_hash FROM users WHERE id::text = $1',
+      [req.familyAccess!.userId]
+    );
+    const user = userRes.rows[0];
+    if (!user) {
+      return res.status(404).json({ error: 'Usuário não encontrado.' });
+    }
+
+    if (user.password_hash) {
+      if (!currentPassword) {
+        return res.status(400).json({ error: 'Informe sua senha atual para confirmar a alteração.' });
+      }
+      const matches = await bcrypt.compare(currentPassword, user.password_hash);
+      if (!matches) {
+        return res.status(401).json({ error: 'A senha atual informada está incorreta.' });
+      }
+    }
+
+    const nextHash = await bcrypt.hash(newPassword, 10);
+    await pool.query(
+      'UPDATE users SET password_hash = $1 WHERE id::text = $2',
+      [nextHash, req.familyAccess!.userId]
+    );
+
+    return res.json({
+      message: user.password_hash
+        ? 'Sua senha foi alterada com sucesso!'
+        : 'Senha de acesso criada com sucesso! Agora você também pode entrar com e-mail e senha.',
+      has_password: true,
+    });
+  } catch (error: any) {
+    console.error('Erro ao atualizar senha do perfil:', error);
+    return res.status(500).json({ error: 'Não foi possível atualizar sua senha agora.' });
   }
 });
 
