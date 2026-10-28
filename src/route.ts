@@ -892,14 +892,30 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
     return res.status(400).json({ error: 'family_id, description, amount, transaction_date, due_date e type são obrigatórios.' });
   }
   const isBenefitCardPayment = payment_method === 'BENEFIT_CARD' && Boolean(account_id);
-  const resolvedInitialStatus = isBenefitCardPayment ? 'PAID' : status;
-  if (resolvedInitialStatus !== 'PENDING' && !isBenefitCardPayment) {
+  const canSettle = req.familyAccess!.role === 'OWNER' || req.familyAccess!.permissions?.transactions_settle === true;
+  const settleImmediately =
+    (isBenefitCardPayment || Boolean(req.body.settle_immediately)) &&
+    Boolean(account_id) &&
+    payment_method !== 'CARD' &&
+    canSettle;
+  const resolvedInitialStatus = settleImmediately ? 'PAID' : status;
+  if (resolvedInitialStatus !== 'PENDING' && !settleImmediately) {
     return res.status(400).json({ error: 'Novos lançamentos devem começar pendentes. Use a ação de baixa para registrar o pagamento.' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    if (account_id && payment_method !== 'CARD') {
+      const accountCheck = await client.query(
+        'SELECT id FROM accounts WHERE id = $1 AND family_id = $2 FOR UPDATE',
+        [account_id, family_id]
+      );
+      if (accountCheck.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'A conta selecionada não pertence a esta família.' });
+      }
+    }
     if (category_id) {
       const categoryResult = await client.query(
         'SELECT id FROM categories WHERE id = $1 AND family_id = $2 AND flow_type = $3 FOR SHARE',
@@ -952,7 +968,7 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
         : description;
 
       const itemAmount = isRecurring ? transactionAmount : installmentAmount;
-      const itemStatus = isBenefitCardPayment && occurrence === 0 ? 'PAID' : 'PENDING';
+      const itemStatus = settleImmediately && occurrence === 0 ? 'PAID' : 'PENDING';
 
       const result = await client.query(
         `INSERT INTO transactions (
