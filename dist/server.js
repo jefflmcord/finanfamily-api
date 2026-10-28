@@ -32,12 +32,12 @@ __export(server_exports, {
   pool: () => pool
 });
 module.exports = __toCommonJS(server_exports);
-var import_express5 = __toESM(require("express"));
+var import_express6 = __toESM(require("express"));
 var import_cors = __toESM(require("cors"));
 var import_dotenv2 = __toESM(require("dotenv"));
 
 // src/route.ts
-var import_express4 = require("express");
+var import_express5 = require("express");
 var import_bcrypt2 = __toESM(require("bcrypt"));
 var import_jsonwebtoken3 = __toESM(require("jsonwebtoken"));
 var import_google_auth_library = require("google-auth-library");
@@ -169,7 +169,7 @@ async function initializeAccessControl() {
       ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS subscription_ends_at DATE,
       ADD COLUMN IF NOT EXISTS admin_notes TEXT,
-      ADD COLUMN IF NOT EXISTS enabled_modules JSONB NOT NULL DEFAULT '["financeiro","mercado"]'::jsonb
+      ADD COLUMN IF NOT EXISTS enabled_modules JSONB NOT NULL DEFAULT '["financeiro","mercado","contratos"]'::jsonb
   `);
   await pool.query(`
     ALTER TABLE families
@@ -298,6 +298,57 @@ async function initializeAccessControl() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS shopping_price_history_family_idx
       ON shopping_price_history (family_id, updated_at DESC)
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS household_contracts (
+      id BIGSERIAL PRIMARY KEY,
+      family_id TEXT NOT NULL,
+      title VARCHAR(140) NOT NULL,
+      provider VARCHAR(120),
+      contract_group VARCHAR(60) NOT NULL DEFAULT 'Streaming & Digital',
+      billing_cycle TEXT NOT NULL DEFAULT 'MONTHLY' CHECK (billing_cycle IN ('MONTHLY', 'ANNUAL')),
+      amount NUMERIC(12, 2) NOT NULL CHECK (amount >= 0),
+      billing_day INT NOT NULL DEFAULT 10 CHECK (billing_day BETWEEN 1 AND 31),
+      renewal_date DATE,
+      payment_method TEXT NOT NULL DEFAULT 'CARD',
+      credit_card_id TEXT,
+      account_id TEXT,
+      status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'PAUSED', 'CANCELED')),
+      cancellation_url VARCHAR(300),
+      support_phone VARCHAR(60),
+      notes VARCHAR(300),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS household_warranties (
+      id BIGSERIAL PRIMARY KEY,
+      family_id TEXT NOT NULL,
+      product_name VARCHAR(140) NOT NULL,
+      brand_model VARCHAR(120),
+      room_category VARCHAR(60) NOT NULL DEFAULT 'Cozinha & Eletros',
+      store_name VARCHAR(120),
+      purchase_date DATE NOT NULL,
+      purchase_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+      warranty_months INT NOT NULL DEFAULT 12,
+      extended_warranty_months INT NOT NULL DEFAULT 0,
+      warranty_expires_at DATE NOT NULL,
+      invoice_number VARCHAR(80),
+      serial_number VARCHAR(80),
+      support_contact VARCHAR(140),
+      notes VARCHAR(300),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS household_contracts_family_idx
+      ON household_contracts (family_id, status, billing_day ASC)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS household_warranties_family_idx
+      ON household_warranties (family_id, warranty_expires_at ASC)
   `);
   await pool.query(`
     UPDATE family_members
@@ -2702,8 +2753,379 @@ router3.post(
 );
 var shoppingRoutes_default = router3;
 
-// src/route.ts
+// src/householdContractsRoutes.ts
+var import_express4 = require("express");
 var router4 = (0, import_express4.Router)();
+function addMonthsToDateStr(dateStr, monthsToAdd) {
+  const [y, m, d] = dateStr.slice(0, 10).split("-").map(Number);
+  const target = new Date(Date.UTC(y, m - 1 + monthsToAdd, 1));
+  const maxDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+  target.setUTCDate(Math.min(d, maxDay));
+  return target.toISOString().slice(0, 10);
+}
+router4.get(
+  "/overview",
+  requireFamilyPermission("family_read"),
+  async (req, res) => {
+    const familyId = String(req.familyAccess.familyId);
+    try {
+      const [contractsRes, warrantiesRes] = await Promise.all([
+        pool.query(
+          `SELECT id, family_id, title, provider, contract_group, billing_cycle,
+                  amount, billing_day, TO_CHAR(renewal_date, 'YYYY-MM-DD') AS renewal_date,
+                  payment_method, credit_card_id, account_id, status,
+                  cancellation_url, support_phone, notes, created_at, updated_at
+           FROM household_contracts
+           WHERE family_id = $1
+           ORDER BY CASE WHEN status = 'ACTIVE' THEN 0 WHEN status = 'PAUSED' THEN 1 ELSE 2 END,
+                    billing_day ASC, title ASC`,
+          [familyId]
+        ),
+        pool.query(
+          `SELECT id, family_id, product_name, brand_model, room_category, store_name,
+                  TO_CHAR(purchase_date, 'YYYY-MM-DD') AS purchase_date,
+                  purchase_amount, warranty_months, extended_warranty_months,
+                  TO_CHAR(warranty_expires_at, 'YYYY-MM-DD') AS warranty_expires_at,
+                  invoice_number, serial_number, support_contact, notes, created_at
+           FROM household_warranties
+           WHERE family_id = $1
+           ORDER BY warranty_expires_at ASC, product_name ASC`,
+          [familyId]
+        )
+      ]);
+      return res.json({
+        contracts: contractsRes.rows.map((r) => ({
+          ...r,
+          amount: Number(r.amount || 0),
+          billing_day: Number(r.billing_day || 10)
+        })),
+        warranties: warrantiesRes.rows.map((w) => ({
+          ...w,
+          purchase_amount: Number(w.purchase_amount || 0),
+          warranty_months: Number(w.warranty_months || 12),
+          extended_warranty_months: Number(w.extended_warranty_months || 0)
+        }))
+      });
+    } catch (error) {
+      console.error("Erro ao carregar contratos e garantias:", error);
+      return res.status(500).json({ error: "N\xE3o foi poss\xEDvel carregar contratos e garantias." });
+    }
+  }
+);
+router4.post(
+  "/contracts",
+  requireFamilyPermission("family_read"),
+  async (req, res) => {
+    const familyId = String(req.familyAccess.familyId);
+    const {
+      title,
+      provider,
+      contract_group = "Streaming & Digital",
+      billing_cycle = "MONTHLY",
+      amount,
+      billing_day = 10,
+      renewal_date,
+      payment_method = "CARD",
+      credit_card_id,
+      account_id,
+      support_phone,
+      notes
+    } = req.body ?? {};
+    const cleanTitle = typeof title === "string" ? title.trim() : "";
+    const parsedAmount = Number(amount);
+    if (!cleanTitle || !Number.isFinite(parsedAmount) || parsedAmount < 0) {
+      return res.status(400).json({ error: "Informe um nome e valor v\xE1lidos para o contrato/assinatura." });
+    }
+    const safeDay = Math.min(31, Math.max(1, Number(billing_day) || 10));
+    const safeCycle = billing_cycle === "ANNUAL" ? "ANNUAL" : "MONTHLY";
+    const safeRenewal = typeof renewal_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(renewal_date) ? renewal_date : null;
+    try {
+      const inserted = await pool.query(
+        `INSERT INTO household_contracts (
+           family_id, title, provider, contract_group, billing_cycle,
+           amount, billing_day, renewal_date, payment_method,
+           credit_card_id, account_id, status, support_phone, notes
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'ACTIVE', $12, $13)
+         RETURNING id, family_id, title, provider, contract_group, billing_cycle,
+                   amount, billing_day, TO_CHAR(renewal_date, 'YYYY-MM-DD') AS renewal_date,
+                   payment_method, credit_card_id, account_id, status, support_phone, notes`,
+        [
+          familyId,
+          cleanTitle.slice(0, 140),
+          typeof provider === "string" && provider.trim() ? provider.trim().slice(0, 120) : null,
+          typeof contract_group === "string" && contract_group.trim() ? contract_group.trim().slice(0, 60) : "Streaming & Digital",
+          safeCycle,
+          Math.round(parsedAmount * 100) / 100,
+          safeDay,
+          safeRenewal,
+          typeof payment_method === "string" ? payment_method : "CARD",
+          credit_card_id ? String(credit_card_id) : null,
+          account_id ? String(account_id) : null,
+          typeof support_phone === "string" && support_phone.trim() ? support_phone.trim().slice(0, 60) : null,
+          typeof notes === "string" && notes.trim() ? notes.trim().slice(0, 300) : null
+        ]
+      );
+      return res.status(201).json(inserted.rows[0]);
+    } catch (error) {
+      console.error("Erro ao criar contrato/assinatura:", error);
+      return res.status(500).json({ error: "N\xE3o foi poss\xEDvel cadastrar o contrato/assinatura." });
+    }
+  }
+);
+router4.put(
+  "/contracts/:id",
+  requireFamilyPermission("family_read"),
+  async (req, res) => {
+    const familyId = String(req.familyAccess.familyId);
+    const contractId = req.params.id;
+    const {
+      title,
+      provider,
+      contract_group,
+      billing_cycle,
+      amount,
+      billing_day,
+      renewal_date,
+      status,
+      support_phone,
+      notes
+    } = req.body ?? {};
+    try {
+      const currentRes = await pool.query(
+        "SELECT * FROM household_contracts WHERE id = $1 AND family_id = $2",
+        [contractId, familyId]
+      );
+      if (currentRes.rows.length === 0) {
+        return res.status(404).json({ error: "Contrato/assinatura n\xE3o encontrado." });
+      }
+      const cur = currentRes.rows[0];
+      const nextStatus = status === "ACTIVE" || status === "PAUSED" || status === "CANCELED" ? status : cur.status;
+      const nextAmount = amount !== void 0 ? Math.max(0, Number(amount) || 0) : Number(cur.amount);
+      const nextDay = billing_day !== void 0 ? Math.min(31, Math.max(1, Number(billing_day) || 10)) : Number(cur.billing_day);
+      const nextRenewal = renewal_date !== void 0 ? typeof renewal_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(renewal_date) ? renewal_date : null : cur.renewal_date;
+      const updated = await pool.query(
+        `UPDATE household_contracts
+         SET title = $1,
+             provider = $2,
+             contract_group = $3,
+             billing_cycle = $4,
+             amount = $5,
+             billing_day = $6,
+             renewal_date = $7,
+             status = $8,
+             support_phone = $9,
+             notes = $10,
+             updated_at = NOW()
+         WHERE id = $11 AND family_id = $12
+         RETURNING id, family_id, title, provider, contract_group, billing_cycle,
+                   amount, billing_day, TO_CHAR(renewal_date, 'YYYY-MM-DD') AS renewal_date,
+                   payment_method, credit_card_id, account_id, status, support_phone, notes`,
+        [
+          typeof title === "string" && title.trim() ? title.trim().slice(0, 140) : cur.title,
+          provider !== void 0 ? typeof provider === "string" && provider.trim() ? provider.trim().slice(0, 120) : null : cur.provider,
+          typeof contract_group === "string" && contract_group.trim() ? contract_group.trim() : cur.contract_group,
+          billing_cycle === "ANNUAL" || billing_cycle === "MONTHLY" ? billing_cycle : cur.billing_cycle,
+          nextAmount,
+          nextDay,
+          nextRenewal,
+          nextStatus,
+          support_phone !== void 0 ? typeof support_phone === "string" && support_phone.trim() ? support_phone.trim().slice(0, 60) : null : cur.support_phone,
+          notes !== void 0 ? typeof notes === "string" && notes.trim() ? notes.trim().slice(0, 300) : null : cur.notes,
+          contractId,
+          familyId
+        ]
+      );
+      return res.json(updated.rows[0]);
+    } catch (error) {
+      console.error("Erro ao atualizar contrato:", error);
+      return res.status(500).json({ error: "N\xE3o foi poss\xEDvel atualizar o contrato." });
+    }
+  }
+);
+router4.delete(
+  "/contracts/:id",
+  requireFamilyPermission("family_read"),
+  async (req, res) => {
+    const familyId = String(req.familyAccess.familyId);
+    try {
+      await pool.query("DELETE FROM household_contracts WHERE id = $1 AND family_id = $2", [
+        req.params.id,
+        familyId
+      ]);
+      return res.json({ message: "Assinatura/contrato removido." });
+    } catch (error) {
+      console.error("Erro ao remover contrato:", error);
+      return res.status(500).json({ error: "N\xE3o foi poss\xEDvel remover o contrato." });
+    }
+  }
+);
+router4.post(
+  "/contracts/:id/launch-financial",
+  requireFamilyPermission("family_read"),
+  async (req, res) => {
+    const familyId = String(req.familyAccess.familyId);
+    const contractId = req.params.id;
+    const {
+      months = 1,
+      payment_target = "ACCOUNT",
+      account_id,
+      credit_card_id,
+      category_id
+    } = req.body ?? {};
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const contractRes = await client.query(
+        "SELECT * FROM household_contracts WHERE id = $1 AND family_id = $2",
+        [contractId, familyId]
+      );
+      if (contractRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Contrato/assinatura n\xE3o encontrado." });
+      }
+      const contract = contractRes.rows[0];
+      const amount = Number(contract.amount || 0);
+      if (amount <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "O contrato precisa ter valor maior que zero." });
+      }
+      let resolvedCategoryId = category_id ? String(category_id) : null;
+      if (!resolvedCategoryId) {
+        const catRes = await client.query(
+          `SELECT id FROM categories
+           WHERE family_id::text = $1 AND flow_type = 'EXPENSE'
+           ORDER BY id ASC LIMIT 1`,
+          [familyId]
+        );
+        resolvedCategoryId = catRes.rows[0]?.id ? String(catRes.rows[0].id) : null;
+      }
+      const now = /* @__PURE__ */ new Date();
+      const baseYear = now.getFullYear();
+      const baseMonth = now.getMonth() + 1;
+      const safeDay = Math.min(28, Math.max(1, Number(contract.billing_day || 10)));
+      const firstDueDate = `${baseYear}-${String(baseMonth).padStart(2, "0")}-${String(safeDay).padStart(2, "0")}`;
+      const count = Math.min(12, Math.max(1, Number(months) || 1));
+      for (let i = 0; i < count; i++) {
+        const dueDate = addMonthsToDateStr(firstDueDate, i);
+        const description = count > 1 ? `${contract.title} (${i + 1}/${count})` : `${contract.title}`;
+        await client.query(
+          `INSERT INTO transactions (
+             family_id, account_id, credit_card_id, category_id, description,
+             amount, transaction_date, due_date, type, status, payment_method
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'EXPENSE', 'PENDING', $8)`,
+          [
+            familyId,
+            payment_target === "ACCOUNT" && account_id ? account_id : null,
+            payment_target === "CARD" && credit_card_id ? credit_card_id : null,
+            resolvedCategoryId,
+            description,
+            amount,
+            dueDate,
+            payment_target === "CARD" ? "CARD" : "BOLETO"
+          ]
+        );
+      }
+      await client.query("COMMIT");
+      return res.json({
+        message: `${count} lan\xE7amento(s) de "${contract.title}" enviado(s) para Contas a Pagar!`
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      console.error("Erro ao lan\xE7ar contrato no financeiro:", error);
+      return res.status(500).json({ error: "N\xE3o foi poss\xEDvel gerar os lan\xE7amentos." });
+    } finally {
+      client.release();
+    }
+  }
+);
+router4.post(
+  "/warranties",
+  requireFamilyPermission("family_read"),
+  async (req, res) => {
+    const familyId = String(req.familyAccess.familyId);
+    const {
+      product_name,
+      brand_model,
+      room_category = "Cozinha & Eletros",
+      store_name,
+      purchase_date,
+      purchase_amount = 0,
+      warranty_months = 12,
+      extended_warranty_months = 0,
+      invoice_number,
+      serial_number,
+      support_contact,
+      notes
+    } = req.body ?? {};
+    const cleanName = typeof product_name === "string" ? product_name.trim() : "";
+    const safePurchaseDate = typeof purchase_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(purchase_date) ? purchase_date : (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+    if (!cleanName) {
+      return res.status(400).json({ error: "Informe o nome do produto/bem." });
+    }
+    const factoryMonths = Math.max(1, Number(warranty_months) || 12);
+    const extendedMonths = Math.max(0, Number(extended_warranty_months) || 0);
+    const totalMonths = factoryMonths + extendedMonths;
+    const expiresAt = addMonthsToDateStr(safePurchaseDate, totalMonths);
+    try {
+      const inserted = await pool.query(
+        `INSERT INTO household_warranties (
+           family_id, product_name, brand_model, room_category, store_name,
+           purchase_date, purchase_amount, warranty_months, extended_warranty_months,
+           warranty_expires_at, invoice_number, serial_number, support_contact, notes
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         RETURNING id, family_id, product_name, brand_model, room_category, store_name,
+                   TO_CHAR(purchase_date, 'YYYY-MM-DD') AS purchase_date,
+                   purchase_amount, warranty_months, extended_warranty_months,
+                   TO_CHAR(warranty_expires_at, 'YYYY-MM-DD') AS warranty_expires_at,
+                   invoice_number, serial_number, support_contact, notes`,
+        [
+          familyId,
+          cleanName.slice(0, 140),
+          typeof brand_model === "string" && brand_model.trim() ? brand_model.trim().slice(0, 120) : null,
+          typeof room_category === "string" && room_category.trim() ? room_category.trim().slice(0, 60) : "Cozinha & Eletros",
+          typeof store_name === "string" && store_name.trim() ? store_name.trim().slice(0, 120) : null,
+          safePurchaseDate,
+          Math.max(0, Number(purchase_amount) || 0),
+          factoryMonths,
+          extendedMonths,
+          expiresAt,
+          typeof invoice_number === "string" && invoice_number.trim() ? invoice_number.trim().slice(0, 80) : null,
+          typeof serial_number === "string" && serial_number.trim() ? serial_number.trim().slice(0, 80) : null,
+          typeof support_contact === "string" && support_contact.trim() ? support_contact.trim().slice(0, 140) : null,
+          typeof notes === "string" && notes.trim() ? notes.trim().slice(0, 300) : null
+        ]
+      );
+      return res.status(201).json(inserted.rows[0]);
+    } catch (error) {
+      console.error("Erro ao cadastrar garantia:", error);
+      return res.status(500).json({ error: "N\xE3o foi poss\xEDvel salvar a garantia do produto." });
+    }
+  }
+);
+router4.delete(
+  "/warranties/:id",
+  requireFamilyPermission("family_read"),
+  async (req, res) => {
+    const familyId = String(req.familyAccess.familyId);
+    try {
+      await pool.query("DELETE FROM household_warranties WHERE id = $1 AND family_id = $2", [
+        req.params.id,
+        familyId
+      ]);
+      return res.json({ message: "Garantia removida com sucesso." });
+    } catch (error) {
+      console.error("Erro ao excluir garantia:", error);
+      return res.status(500).json({ error: "N\xE3o foi poss\xEDvel excluir a garantia." });
+    }
+  }
+);
+var householdContractsRoutes_default = router4;
+
+// src/route.ts
+var router5 = (0, import_express5.Router)();
 var JWT_SECRET3 = process.env.JWT_SECRET || "finanfamily_secreto_2026";
 var GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 var googleClient = new import_google_auth_library.OAuth2Client(GOOGLE_CLIENT_ID);
@@ -2714,7 +3136,7 @@ function addMonthsToDate(dateValue, monthOffset) {
   targetMonth.setUTCDate(Math.min(day, lastDayOfMonth));
   return targetMonth.toISOString().split("T")[0];
 }
-router4.get("/", (req, res) => {
+router5.get("/", (req, res) => {
   if (req.query.warmup) {
     pool.query("SELECT 1").catch(() => {
     });
@@ -2739,7 +3161,7 @@ async function ensureInvestmentCategory(client, familyId) {
   );
   return newCat.rows[0].id;
 }
-router4.post("/api/login", async (req, res) => {
+router5.post("/api/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: "E-mail e palavra-passe s\xE3o obrigat\xF3rios." });
@@ -2776,7 +3198,7 @@ router4.post("/api/login", async (req, res) => {
     return res.status(500).json({ error: "Erro interno no servidor." });
   }
 });
-router4.post("/api/auth/google", async (req, res) => {
+router5.post("/api/auth/google", async (req, res) => {
   const { credential } = req.body;
   if (!credential) return res.status(400).json({ error: "Token do Google n\xE3o fornecido." });
   const client = await pool.connect();
@@ -2939,12 +3361,13 @@ router4.post("/api/auth/google", async (req, res) => {
     client.release();
   }
 });
-router4.use(publicRouter);
-router4.use("/api", authenticateFamilyMember);
-router4.use(familyRoutes_default);
-router4.use("/api/annual-provisions", annualProvisions_default);
-router4.use("/api/shopping", shoppingRoutes_default);
-router4.get("/api/accounts", requireFamilyPermission("family_read"), async (req, res) => {
+router5.use(publicRouter);
+router5.use("/api", authenticateFamilyMember);
+router5.use(familyRoutes_default);
+router5.use("/api/annual-provisions", annualProvisions_default);
+router5.use("/api/shopping", shoppingRoutes_default);
+router5.use("/api/household", householdContractsRoutes_default);
+router5.get("/api/accounts", requireFamilyPermission("family_read"), async (req, res) => {
   const family_id = req.familyAccess.familyId;
   try {
     const result = await pool.query(
@@ -2960,7 +3383,7 @@ router4.get("/api/accounts", requireFamilyPermission("family_read"), async (req,
     return res.status(500).json({ error: err.message });
   }
 });
-router4.post("/api/accounts", requireFamilyPermission("accounts_manage"), async (req, res) => {
+router5.post("/api/accounts", requireFamilyPermission("accounts_manage"), async (req, res) => {
   const { bank_name, agency, account_number, pix_key, initial_balance } = req.body;
   const normalizedBank = typeof bank_name === "string" ? bank_name.trim() : "";
   const normalizedAccount = typeof account_number === "string" ? account_number.trim() : "";
@@ -2990,7 +3413,7 @@ router4.post("/api/accounts", requireFamilyPermission("accounts_manage"), async 
     return res.status(500).json({ error: err.message });
   }
 });
-router4.put("/api/accounts/:id", requireFamilyPermission("accounts_manage"), async (req, res) => {
+router5.put("/api/accounts/:id", requireFamilyPermission("accounts_manage"), async (req, res) => {
   const { bank_name, agency, account_number, pix_key, initial_balance } = req.body;
   const normalizedBank = typeof bank_name === "string" ? bank_name.trim() : "";
   const normalizedAccount = typeof account_number === "string" ? account_number.trim() : "";
@@ -3038,7 +3461,7 @@ router4.put("/api/accounts/:id", requireFamilyPermission("accounts_manage"), asy
     client.release();
   }
 });
-router4.delete("/api/accounts/:id", requireFamilyPermission("accounts_manage"), async (req, res) => {
+router5.delete("/api/accounts/:id", requireFamilyPermission("accounts_manage"), async (req, res) => {
   try {
     const accountResult = await pool.query(
       "SELECT id FROM accounts WHERE id = $1 AND family_id = $2",
@@ -3063,7 +3486,7 @@ router4.delete("/api/accounts/:id", requireFamilyPermission("accounts_manage"), 
     return res.status(500).json({ error: err.message });
   }
 });
-router4.get("/api/categories", requireFamilyPermission("family_read"), async (req, res) => {
+router5.get("/api/categories", requireFamilyPermission("family_read"), async (req, res) => {
   const family_id = String(req.familyAccess.familyId);
   try {
     const result = await pool.query(
@@ -3094,7 +3517,7 @@ router4.get("/api/categories", requireFamilyPermission("family_read"), async (re
     return res.status(500).json({ error: err.message });
   }
 });
-router4.post("/api/categories", requireFamilyPermission("categories_manage"), async (req, res) => {
+router5.post("/api/categories", requireFamilyPermission("categories_manage"), async (req, res) => {
   const { name, type = "VARIABLE", flow_type = "EXPENSE", color = "#10b981" } = req.body;
   const budgetAmount = req.body.budget_amount === "" || req.body.budget_amount === null || req.body.budget_amount === void 0 ? null : Number(req.body.budget_amount);
   const family_id = req.familyAccess.familyId;
@@ -3122,7 +3545,7 @@ router4.post("/api/categories", requireFamilyPermission("categories_manage"), as
     return res.status(500).json({ error: err.message });
   }
 });
-router4.put("/api/categories/:id", requireFamilyPermission("categories_manage"), async (req, res) => {
+router5.put("/api/categories/:id", requireFamilyPermission("categories_manage"), async (req, res) => {
   const { id } = req.params;
   const { name, type, flow_type, color } = req.body;
   const hasBudgetAmount = Object.prototype.hasOwnProperty.call(req.body, "budget_amount");
@@ -3179,7 +3602,7 @@ router4.put("/api/categories/:id", requireFamilyPermission("categories_manage"),
     client.release();
   }
 });
-router4.delete("/api/categories/:id", requireFamilyPermission("categories_manage"), async (req, res) => {
+router5.delete("/api/categories/:id", requireFamilyPermission("categories_manage"), async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
   try {
@@ -3218,7 +3641,7 @@ router4.delete("/api/categories/:id", requireFamilyPermission("categories_manage
     client.release();
   }
 });
-router4.get("/api/credit-cards", requireFamilyPermission("family_read"), async (req, res) => {
+router5.get("/api/credit-cards", requireFamilyPermission("family_read"), async (req, res) => {
   const family_id = req.familyAccess.familyId;
   try {
     const result = await pool.query(`SELECT * FROM credit_cards WHERE family_id = $1 ORDER BY name ASC`, [String(family_id)]);
@@ -3227,7 +3650,7 @@ router4.get("/api/credit-cards", requireFamilyPermission("family_read"), async (
     return res.status(500).json({ error: err.message });
   }
 });
-router4.post("/api/credit-cards", requireFamilyPermission("cards_manage"), async (req, res) => {
+router5.post("/api/credit-cards", requireFamilyPermission("cards_manage"), async (req, res) => {
   const { name, brand, total_limit, closing_day, due_day } = req.body;
   const family_id = req.familyAccess.familyId;
   const parsedLimit = Number(total_limit) || 0;
@@ -3245,7 +3668,7 @@ router4.post("/api/credit-cards", requireFamilyPermission("cards_manage"), async
     return res.status(500).json({ error: err.message });
   }
 });
-router4.put("/api/credit-cards/:id", requireFamilyPermission("cards_manage"), async (req, res) => {
+router5.put("/api/credit-cards/:id", requireFamilyPermission("cards_manage"), async (req, res) => {
   const { id } = req.params;
   const { name, brand, total_limit, closing_day, due_day } = req.body;
   const parsedLimit = Number(total_limit);
@@ -3304,7 +3727,7 @@ router4.put("/api/credit-cards/:id", requireFamilyPermission("cards_manage"), as
     client.release();
   }
 });
-router4.delete("/api/credit-cards/:id", requireFamilyPermission("cards_manage"), async (req, res) => {
+router5.delete("/api/credit-cards/:id", requireFamilyPermission("cards_manage"), async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
   try {
@@ -3341,7 +3764,7 @@ router4.delete("/api/credit-cards/:id", requireFamilyPermission("cards_manage"),
     client.release();
   }
 });
-router4.get("/api/transactions", requireFamilyPermission("family_read"), async (req, res) => {
+router5.get("/api/transactions", requireFamilyPermission("family_read"), async (req, res) => {
   const family_id = req.familyAccess.familyId;
   try {
     const result = await pool.query(
@@ -3358,7 +3781,7 @@ router4.get("/api/transactions", requireFamilyPermission("family_read"), async (
     return res.status(500).json({ error: err.message });
   }
 });
-router4.post("/api/transactions", requireFamilyPermission("transactions_create"), async (req, res) => {
+router5.post("/api/transactions", requireFamilyPermission("transactions_create"), async (req, res) => {
   const {
     account_id,
     credit_card_id,
@@ -3466,7 +3889,7 @@ router4.post("/api/transactions", requireFamilyPermission("transactions_create")
     client.release();
   }
 });
-router4.post("/api/transactions/batch", requireFamilyPermission("transactions_create"), async (req, res) => {
+router5.post("/api/transactions/batch", requireFamilyPermission("transactions_create"), async (req, res) => {
   const family_id = req.familyAccess.familyId;
   const canSettle = req.familyAccess.role === "OWNER" || req.familyAccess.permissions?.transactions_settle === true;
   const targetType = req.body?.target_type === "CARD" ? "CARD" : "ACCOUNT";
@@ -3580,7 +4003,7 @@ router4.post("/api/transactions/batch", requireFamilyPermission("transactions_cr
     client.release();
   }
 });
-router4.get("/api/goals", requireFamilyPermission("family_read"), async (req, res) => {
+router5.get("/api/goals", requireFamilyPermission("family_read"), async (req, res) => {
   const family_id = req.familyAccess.familyId;
   try {
     const result = await pool.query(`SELECT * FROM goals WHERE family_id = $1 ORDER BY created_at DESC`, [String(family_id)]);
@@ -3589,7 +4012,7 @@ router4.get("/api/goals", requireFamilyPermission("family_read"), async (req, re
     return res.status(500).json({ error: err.message });
   }
 });
-router4.post("/api/goals", requireFamilyPermission("goals_manage"), async (req, res) => {
+router5.post("/api/goals", requireFamilyPermission("goals_manage"), async (req, res) => {
   const { title, target_amount, months } = req.body;
   const family_id = req.familyAccess.familyId;
   if (!family_id || !title || !target_amount || !months) {
@@ -3644,7 +4067,7 @@ router4.post("/api/goals", requireFamilyPermission("goals_manage"), async (req, 
     client.release();
   }
 });
-router4.put("/api/transactions/:id", requireFamilyPermission("transactions_edit"), async (req, res) => {
+router5.put("/api/transactions/:id", requireFamilyPermission("transactions_edit"), async (req, res) => {
   const { id } = req.params;
   const { description, amount, due_date, status, category_id, account_id, payment_method } = req.body;
   const client = await pool.connect();
@@ -3747,7 +4170,7 @@ router4.put("/api/transactions/:id", requireFamilyPermission("transactions_edit"
     client.release();
   }
 });
-router4.patch("/api/transactions/:id/pay", requireFamilyPermission("transactions_settle"), async (req, res) => {
+router5.patch("/api/transactions/:id/pay", requireFamilyPermission("transactions_settle"), async (req, res) => {
   const { id } = req.params;
   const { account_id, paid_amount } = req.body;
   const client = await pool.connect();
@@ -3810,7 +4233,7 @@ router4.patch("/api/transactions/:id/pay", requireFamilyPermission("transactions
     client.release();
   }
 });
-router4.patch("/api/transactions/:id/unpay", requireFamilyPermission("transactions_settle"), async (req, res) => {
+router5.patch("/api/transactions/:id/unpay", requireFamilyPermission("transactions_settle"), async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
   try {
@@ -3859,7 +4282,7 @@ router4.patch("/api/transactions/:id/unpay", requireFamilyPermission("transactio
     client.release();
   }
 });
-router4.delete("/api/transactions/:id", requireFamilyPermission("transactions_delete"), async (req, res) => {
+router5.delete("/api/transactions/:id", requireFamilyPermission("transactions_delete"), async (req, res) => {
   const { id } = req.params;
   const { scope, parent_id } = req.query;
   const deleteSeries = scope === "all" && parent_id && parent_id !== "null";
@@ -3901,13 +4324,13 @@ router4.delete("/api/transactions/:id", requireFamilyPermission("transactions_de
     client.release();
   }
 });
-var route_default = router4;
+var route_default = router5;
 
 // src/server.ts
 import_dotenv2.default.config();
-var app = (0, import_express5.default)();
+var app = (0, import_express6.default)();
 app.use((0, import_cors.default)());
-app.use(import_express5.default.json());
+app.use(import_express6.default.json());
 app.use(route_default);
 var PORT = process.env.PORT || 4e3;
 initializeAccessControl().then(() => {

@@ -112,7 +112,7 @@ export async function initializeAccessControl(): Promise<void> {
       ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS subscription_ends_at DATE,
       ADD COLUMN IF NOT EXISTS admin_notes TEXT,
-      ADD COLUMN IF NOT EXISTS enabled_modules JSONB NOT NULL DEFAULT '["financeiro","mercado"]'::jsonb
+      ADD COLUMN IF NOT EXISTS enabled_modules JSONB NOT NULL DEFAULT '["financeiro","mercado","contratos"]'::jsonb
   `);
   await pool.query(`
     ALTER TABLE families
@@ -241,6 +241,57 @@ export async function initializeAccessControl(): Promise<void> {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS shopping_price_history_family_idx
       ON shopping_price_history (family_id, updated_at DESC)
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS household_contracts (
+      id BIGSERIAL PRIMARY KEY,
+      family_id TEXT NOT NULL,
+      title VARCHAR(140) NOT NULL,
+      provider VARCHAR(120),
+      contract_group VARCHAR(60) NOT NULL DEFAULT 'Streaming & Digital',
+      billing_cycle TEXT NOT NULL DEFAULT 'MONTHLY' CHECK (billing_cycle IN ('MONTHLY', 'ANNUAL')),
+      amount NUMERIC(12, 2) NOT NULL CHECK (amount >= 0),
+      billing_day INT NOT NULL DEFAULT 10 CHECK (billing_day BETWEEN 1 AND 31),
+      renewal_date DATE,
+      payment_method TEXT NOT NULL DEFAULT 'CARD',
+      credit_card_id TEXT,
+      account_id TEXT,
+      status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'PAUSED', 'CANCELED')),
+      cancellation_url VARCHAR(300),
+      support_phone VARCHAR(60),
+      notes VARCHAR(300),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS household_warranties (
+      id BIGSERIAL PRIMARY KEY,
+      family_id TEXT NOT NULL,
+      product_name VARCHAR(140) NOT NULL,
+      brand_model VARCHAR(120),
+      room_category VARCHAR(60) NOT NULL DEFAULT 'Cozinha & Eletros',
+      store_name VARCHAR(120),
+      purchase_date DATE NOT NULL,
+      purchase_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+      warranty_months INT NOT NULL DEFAULT 12,
+      extended_warranty_months INT NOT NULL DEFAULT 0,
+      warranty_expires_at DATE NOT NULL,
+      invoice_number VARCHAR(80),
+      serial_number VARCHAR(80),
+      support_contact VARCHAR(140),
+      notes VARCHAR(300),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS household_contracts_family_idx
+      ON household_contracts (family_id, status, billing_day ASC)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS household_warranties_family_idx
+      ON household_warranties (family_id, warranty_expires_at ASC)
   `);
   await pool.query(`
     UPDATE family_members
