@@ -736,13 +736,15 @@ router.post(
           );
           linkedTransactionId = String(txInsert.rows[0].id);
         } else {
-          const isPaid = Boolean(settle_immediately && account_id);
+          const isPaid = Boolean((settle_immediately || payment_target === 'BENEFIT') && account_id);
+          const resolvedPaymentMethod =
+            payment_target === 'BENEFIT' ? 'BENEFIT_CARD' : payment_method || 'PIX';
           const txInsert = await client.query(
             `INSERT INTO transactions (
                family_id, account_id, category_id, description, amount, paid_amount,
-               transaction_date, due_date, type, status, payment_method
+               payment_date, transaction_date, due_date, type, status, payment_method
              )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'EXPENSE', $8, $9)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, 'EXPENSE', $9, $10)
              RETURNING id`,
             [
               familyId,
@@ -751,9 +753,10 @@ router.post(
               txDescription,
               finalTotal,
               isPaid ? finalTotal : null,
+              isPaid ? txDate : null,
               txDate,
               isPaid ? 'PAID' : 'PENDING',
-              payment_method || 'PIX',
+              resolvedPaymentMethod,
             ]
           );
           linkedTransactionId = String(txInsert.rows[0].id);

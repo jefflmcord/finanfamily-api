@@ -287,17 +287,21 @@ router.use('/api/shopping', shoppingRouter);
 router.use('/api/household', householdContractsRouter);
 router.use('/api/vehicles', vehiclesRouter);
 
-// 3. CONTAS BANCÁRIAS
+// 3. CONTAS BANCÁRIAS E VALES / BENEFÍCIOS (CAJU, ALELO, TICKET, FLASH, VR)
 router.get('/api/accounts', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {
   const family_id = req.familyAccess!.familyId;
 
   try {
     const result = await pool.query(
       `SELECT id, name, bank_name, agency, account_number, pix_key,
-              initial_balance, balance
+              initial_balance, balance,
+              COALESCE(account_type, 'BANK') AS account_type,
+              benefit_category,
+              COALESCE(monthly_recharge_amount, 0) AS monthly_recharge_amount,
+              recharge_day
        FROM accounts
        WHERE family_id = $1
-       ORDER BY name ASC`,
+       ORDER BY CASE WHEN COALESCE(account_type, 'BANK') = 'BANK' THEN 0 ELSE 1 END, name ASC`,
       [String(family_id)]
     );
     return res.json(result.rows);
@@ -307,22 +311,43 @@ router.get('/api/accounts', requireFamilyPermission('family_read'), async (req: 
 });
 
 router.post('/api/accounts', requireFamilyPermission('accounts_manage'), async (req: Request, res: Response): Promise<any> => {
-  const { bank_name, agency, account_number, pix_key, initial_balance } = req.body;
+  const {
+    bank_name,
+    agency,
+    account_number,
+    pix_key,
+    initial_balance,
+    account_type = 'BANK',
+    benefit_category = null,
+    monthly_recharge_amount = 0,
+    recharge_day = null,
+  } = req.body;
+  const safeType = account_type === 'BENEFIT_CARD' ? 'BENEFIT_CARD' : 'BANK';
   const normalizedBank = typeof bank_name === 'string' ? bank_name.trim() : '';
-  const normalizedAccount = typeof account_number === 'string' ? account_number.trim() : '';
+  const rawAccount = typeof account_number === 'string' ? account_number.trim() : '';
+  const normalizedAccount = safeType === 'BENEFIT_CARD' ? (rawAccount || 'Vale/Benefício') : rawAccount;
   const openingBalance = Math.round(Number(initial_balance) * 100) / 100;
+  const parsedRecharge = Math.max(0, Math.round(Number(monthly_recharge_amount || 0) * 100) / 100);
+  const parsedRechargeDay =
+    recharge_day !== null && recharge_day !== '' && Number(recharge_day) >= 1 && Number(recharge_day) <= 31
+      ? Math.round(Number(recharge_day))
+      : null;
 
   if (!normalizedBank || !normalizedAccount || !Number.isFinite(openingBalance)) {
-    return res.status(400).json({ error: 'Informe um banco, número da conta e saldo inicial válidos.' });
+    return res.status(400).json({ error: 'Informe um nome/banco e saldo inicial válidos.' });
   }
 
   try {
     const result = await pool.query(
       `INSERT INTO accounts (
-         family_id, name, bank_name, agency, account_number, pix_key, initial_balance, balance
+         family_id, name, bank_name, agency, account_number, pix_key,
+         initial_balance, balance, account_type, benefit_category,
+         monthly_recharge_amount, recharge_day
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
-       RETURNING id, name, bank_name, agency, account_number, pix_key, initial_balance, balance`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11)
+       RETURNING id, name, bank_name, agency, account_number, pix_key,
+                 initial_balance, balance, account_type, benefit_category,
+                 monthly_recharge_amount, recharge_day`,
       [
         req.familyAccess!.familyId,
         `${normalizedBank} • ${normalizedAccount}`,
@@ -330,22 +355,47 @@ router.post('/api/accounts', requireFamilyPermission('accounts_manage'), async (
         typeof agency === 'string' ? agency.trim() || null : null,
         normalizedAccount,
         typeof pix_key === 'string' ? pix_key.trim() || null : null,
-        openingBalance
+        openingBalance,
+        safeType,
+        typeof benefit_category === 'string' && benefit_category.trim() ? benefit_category.trim() : null,
+        parsedRecharge,
+        parsedRechargeDay,
       ]
     );
-    return res.status(201).json({ message: 'Conta bancária cadastrada.', account: result.rows[0] });
+    return res.status(201).json({
+      message: safeType === 'BENEFIT_CARD' ? 'Cartão de benefício/vale cadastrado.' : 'Conta bancária cadastrada.',
+      account: result.rows[0],
+    });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
 });
 
 router.put('/api/accounts/:id', requireFamilyPermission('accounts_manage'), async (req: Request, res: Response): Promise<any> => {
-  const { bank_name, agency, account_number, pix_key, initial_balance } = req.body;
+  const {
+    bank_name,
+    agency,
+    account_number,
+    pix_key,
+    initial_balance,
+    account_type = 'BANK',
+    benefit_category = null,
+    monthly_recharge_amount = 0,
+    recharge_day = null,
+  } = req.body;
+  const safeType = account_type === 'BENEFIT_CARD' ? 'BENEFIT_CARD' : 'BANK';
   const normalizedBank = typeof bank_name === 'string' ? bank_name.trim() : '';
-  const normalizedAccount = typeof account_number === 'string' ? account_number.trim() : '';
+  const rawAccount = typeof account_number === 'string' ? account_number.trim() : '';
+  const normalizedAccount = safeType === 'BENEFIT_CARD' ? (rawAccount || 'Vale/Benefício') : rawAccount;
   const openingBalance = Math.round(Number(initial_balance) * 100) / 100;
+  const parsedRecharge = Math.max(0, Math.round(Number(monthly_recharge_amount || 0) * 100) / 100);
+  const parsedRechargeDay =
+    recharge_day !== null && recharge_day !== '' && Number(recharge_day) >= 1 && Number(recharge_day) <= 31
+      ? Math.round(Number(recharge_day))
+      : null;
+
   if (!normalizedBank || !normalizedAccount || !Number.isFinite(openingBalance)) {
-    return res.status(400).json({ error: 'Informe um banco, número da conta e saldo inicial válidos.' });
+    return res.status(400).json({ error: 'Informe um nome/banco e saldo inicial válidos.' });
   }
 
   const client = await pool.connect();
@@ -358,16 +408,20 @@ router.put('/api/accounts/:id', requireFamilyPermission('accounts_manage'), asyn
     const current = currentResult.rows[0];
     if (!current) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Conta bancária não encontrada.' });
+      return res.status(404).json({ error: 'Conta ou benefício não encontrado.' });
     }
 
     const balanceAdjustment = openingBalance - Number(current.initial_balance);
     const result = await client.query(
       `UPDATE accounts
        SET name = $1, bank_name = $2, agency = $3, account_number = $4,
-           pix_key = $5, initial_balance = $6, balance = balance + $7
-       WHERE id = $8 AND family_id = $9
-       RETURNING id, name, bank_name, agency, account_number, pix_key, initial_balance, balance`,
+           pix_key = $5, initial_balance = $6, balance = balance + $7,
+           account_type = $8, benefit_category = $9,
+           monthly_recharge_amount = $10, recharge_day = $11
+       WHERE id = $12 AND family_id = $13
+       RETURNING id, name, bank_name, agency, account_number, pix_key,
+                 initial_balance, balance, account_type, benefit_category,
+                 monthly_recharge_amount, recharge_day`,
       [
         `${normalizedBank} • ${normalizedAccount}`,
         normalizedBank,
@@ -376,12 +430,67 @@ router.put('/api/accounts/:id', requireFamilyPermission('accounts_manage'), asyn
         typeof pix_key === 'string' ? pix_key.trim() || null : null,
         openingBalance,
         balanceAdjustment,
+        safeType,
+        typeof benefit_category === 'string' && benefit_category.trim() ? benefit_category.trim() : null,
+        parsedRecharge,
+        parsedRechargeDay,
         req.params.id,
-        req.familyAccess!.familyId
+        req.familyAccess!.familyId,
       ]
     );
     await client.query('COMMIT');
-    return res.json({ message: 'Conta bancária atualizada.', account: result.rows[0] });
+    return res.json({ message: 'Cadastro atualizado com sucesso.', account: result.rows[0] });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// 3.1 RECARREGAR SALDO DO VALE / BENEFÍCIO (CRÉDITO MENSAL EM 1 CLIQUE)
+router.post('/api/accounts/:id/recharge', requireFamilyPermission('accounts_manage'), async (req: Request, res: Response): Promise<any> => {
+  const familyId = String(req.familyAccess!.familyId);
+  const accountId = req.params.id;
+  const rawAmount = req.body?.amount;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const accRes = await client.query(
+      'SELECT * FROM accounts WHERE id = $1 AND family_id = $2 FOR UPDATE',
+      [accountId, familyId]
+    );
+    if (accRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Benefício/Vale não encontrado.' });
+    }
+    const acc = accRes.rows[0];
+    const rechargeValue =
+      rawAmount !== undefined && Number(rawAmount) > 0
+        ? Math.round(Number(rawAmount) * 100) / 100
+        : Math.round(Number(acc.monthly_recharge_amount || 0) * 100) / 100;
+
+    if (!Number.isFinite(rechargeValue) || rechargeValue <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Informe um valor de recarga maior que zero.' });
+    }
+
+    const updatedAcc = await client.query(
+      `UPDATE accounts
+       SET balance = balance + $1
+       WHERE id = $2 AND family_id = $3
+       RETURNING id, name, bank_name, agency, account_number, pix_key,
+                 initial_balance, balance, account_type, benefit_category,
+                 monthly_recharge_amount, recharge_day`,
+      [rechargeValue, accountId, familyId]
+    );
+
+    await client.query('COMMIT');
+    return res.json({
+      message: `Recarga de R$ ${rechargeValue.toFixed(2).replace('.', ',')} creditada no saldo de ${acc.bank_name}!`,
+      account: updatedAcc.rows[0],
+    });
   } catch (err: any) {
     await client.query('ROLLBACK');
     return res.status(500).json({ error: err.message });
@@ -782,7 +891,9 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
       !transaction_date || !due_date || !type) {
     return res.status(400).json({ error: 'family_id, description, amount, transaction_date, due_date e type são obrigatórios.' });
   }
-  if (status !== 'PENDING') {
+  const isBenefitCardPayment = payment_method === 'BENEFIT_CARD' && Boolean(account_id);
+  const resolvedInitialStatus = isBenefitCardPayment ? 'PAID' : status;
+  if (resolvedInitialStatus !== 'PENDING' && !isBenefitCardPayment) {
     return res.status(400).json({ error: 'Novos lançamentos devem começar pendentes. Use a ação de baixa para registrar o pagamento.' });
   }
 
@@ -840,21 +951,26 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
         ? `${description} (${installmentNumber}/${totalInst})`
         : description;
 
+      const itemAmount = isRecurring ? transactionAmount : installmentAmount;
+      const itemStatus = isBenefitCardPayment && occurrence === 0 ? 'PAID' : 'PENDING';
+
       const result = await client.query(
         `INSERT INTO transactions (
           family_id, account_id, credit_card_id, category_id,
-          description, amount, type, status, transaction_date, due_date,
+          description, amount, paid_amount, payment_date, type, status, transaction_date, due_date,
           installment_number, total_installments, parent_transaction_id, payment_method
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *;`,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *;`,
         [
           family_id,
           payment_method === 'CARD' ? null : (account_id || null),
           payment_method === 'CARD' ? (credit_card_id || null) : null,
           category_id || null,
           transactionDescription,
-          isRecurring ? transactionAmount : installmentAmount,
+          itemAmount,
+          itemStatus === 'PAID' ? itemAmount : null,
+          itemStatus === 'PAID' ? formattedTransactionDate : null,
           type,
-          status,
+          itemStatus,
           formattedTransactionDate,
           formattedDueDate,
           isRecurring ? 1 : installmentNumber,
@@ -863,6 +979,14 @@ router.post('/api/transactions', requireFamilyPermission('transactions_create'),
           payment_method
         ]
       );
+
+      if (itemStatus === 'PAID' && account_id) {
+        const balanceDelta = type === 'INCOME' ? itemAmount : -itemAmount;
+        await client.query(
+          'UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND family_id = $3',
+          [balanceDelta, account_id, family_id]
+        );
+      }
 
       if (!isRecurring && occurrence === 0) {
         parentId = result.rows[0].id;

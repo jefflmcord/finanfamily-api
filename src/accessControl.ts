@@ -352,6 +352,13 @@ export async function initializeAccessControl(): Promise<void> {
       ON vehicle_records (family_id, vehicle_id, record_date DESC, id DESC)
   `);
   await pool.query(`
+    ALTER TABLE accounts
+      ADD COLUMN IF NOT EXISTS account_type VARCHAR(30) NOT NULL DEFAULT 'BANK',
+      ADD COLUMN IF NOT EXISTS benefit_category VARCHAR(40),
+      ADD COLUMN IF NOT EXISTS monthly_recharge_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS recharge_day INT
+  `);
+  await pool.query(`
     UPDATE family_members
     SET permissions = jsonb_set(COALESCE(permissions, '{}'::jsonb), '{provisions_manage}', 'false'::jsonb, true)
     WHERE NOT COALESCE(permissions ? 'provisions_manage', false)
