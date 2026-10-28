@@ -7,6 +7,7 @@ import familyRouter, { publicFamilyRouter, seedDefaultFamilyResources } from './
 import annualProvisionsRouter from './annualProvisions';
 import shoppingRouter from './shoppingRoutes';
 import householdContractsRouter from './householdContractsRoutes';
+import vehiclesRouter from './vehiclesRoutes';
 import {
   authenticateFamilyMember,
   FAMILY_PERMISSIONS,
@@ -284,6 +285,7 @@ router.use(familyRouter);
 router.use('/api/annual-provisions', annualProvisionsRouter);
 router.use('/api/shopping', shoppingRouter);
 router.use('/api/household', householdContractsRouter);
+router.use('/api/vehicles', vehiclesRouter);
 
 // 3. CONTAS BANCÁRIAS
 router.get('/api/accounts', requireFamilyPermission('family_read'), async (req: Request, res: Response): Promise<any> => {

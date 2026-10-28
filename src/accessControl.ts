@@ -294,6 +294,64 @@ export async function initializeAccessControl(): Promise<void> {
       ON household_warranties (family_id, warranty_expires_at ASC)
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS family_vehicles (
+      id BIGSERIAL PRIMARY KEY,
+      family_id TEXT NOT NULL,
+      nickname VARCHAR(100) NOT NULL,
+      vehicle_type VARCHAR(30) NOT NULL DEFAULT 'CAR',
+      brand_model VARCHAR(120) NOT NULL,
+      manufacture_year INT,
+      model_year INT,
+      license_plate VARCHAR(20),
+      fuel_type VARCHAR(40) NOT NULL DEFAULT 'FLEX',
+      current_odometer INT NOT NULL DEFAULT 0,
+      fipe_estimated_value NUMERIC(12, 2) NOT NULL DEFAULT 0,
+      ipva_estimated_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+      ipva_due_month INT NOT NULL DEFAULT 1 CHECK (ipva_due_month BETWEEN 1 AND 12),
+      insurance_provider VARCHAR(120),
+      insurance_policy_number VARCHAR(80),
+      insurance_renewal_date DATE,
+      insurance_annual_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+      insurance_assistance_phone VARCHAR(60),
+      next_revision_km INT,
+      next_revision_date DATE,
+      status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'SOLD', 'INACTIVE')),
+      notes VARCHAR(300),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS vehicle_records (
+      id BIGSERIAL PRIMARY KEY,
+      family_id TEXT NOT NULL,
+      vehicle_id BIGINT NOT NULL REFERENCES family_vehicles(id) ON DELETE CASCADE,
+      record_type VARCHAR(30) NOT NULL DEFAULT 'FUEL',
+      title VARCHAR(140) NOT NULL,
+      service_category VARCHAR(60) NOT NULL DEFAULT 'Abastecimento',
+      record_date DATE NOT NULL,
+      odometer_km INT,
+      liters NUMERIC(10, 3),
+      price_per_liter NUMERIC(10, 3),
+      fuel_efficiency_kml NUMERIC(10, 2),
+      amount NUMERIC(12, 2) NOT NULL CHECK (amount >= 0),
+      provider_name VARCHAR(120),
+      next_service_km INT,
+      next_service_date DATE,
+      financial_transaction_id TEXT,
+      notes VARCHAR(300),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS family_vehicles_family_idx
+      ON family_vehicles (family_id, status, id ASC)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS vehicle_records_family_vehicle_idx
+      ON vehicle_records (family_id, vehicle_id, record_date DESC, id DESC)
+  `);
+  await pool.query(`
     UPDATE family_members
     SET permissions = jsonb_set(COALESCE(permissions, '{}'::jsonb), '{provisions_manage}', 'false'::jsonb, true)
     WHERE NOT COALESCE(permissions ? 'provisions_manage', false)
